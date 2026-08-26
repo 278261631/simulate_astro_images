@@ -21,7 +21,7 @@
     "numx": 1024,
     "numy": 1024,
     "pixel_size_um": 3.75,
-    "focal_length_mm": 500.0,
+    "focal_length_mm": 21.95,
     "gain_default": 100,
     "gain_min": 0,
     "gain_max": 300,
