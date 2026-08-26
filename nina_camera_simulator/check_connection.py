@@ -19,15 +19,17 @@ import urllib.request
 
 PROPS = [
     "name", "description", "driverinfo", "driverversion", "interfaceversion",
-    "connected", "cameraxsize", "cameraysize", "numx", "numy",
+    "connected", "state", "camerastate", "cameraxsize", "cameraysize",
+    "pixelsizex", "pixelsizey", "numx", "numy",
     "pixelpersizex", "pixelpersizey", "maxbinx", "maxbiny", "binx", "biny",
     "bincamerax", "bincameray", "canasymmetricbin", "startx", "starty",
     "readoutmode", "readoutmodes", "numreadoutmodes", "sensorname", "sensortype",
-    "gain", "gainmin", "gainmax", "gainsetup", "offset", "offsetmin", "offsetmax",
-    "offsetsetup", "electronsperadu", "exposuremin", "exposuremax",
+    "gain", "gainmin", "gainmax", "gainsetup", "gains", "offset", "offsetmin",
+    "offsetmax", "offsetsetup", "electronsperadu", "exposuremin", "exposuremax",
     "exposureresolution", "canfastreadout", "fastreadout", "canshowwindow",
     "canstopexposure", "hasshutter", "hasdrsupport", "cansetccdtemperature",
-    "ccdtemperature", "temperature", "coolerpower", "heatcoolerpower",
+    "ccdtemperature", "temperature", "setccdtemperature", "cooleron",
+    "cangetcoolerpower", "coolerpower", "heatcoolerpower",
     "state", "imageready", "lastduration", "laststart",
 ]
 

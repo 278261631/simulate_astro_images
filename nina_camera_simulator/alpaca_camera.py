@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import socket
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import count
@@ -75,6 +75,10 @@ class CameraDevice:
         return str(self.cfg.get("name", "NINA Simulated Alpaca Camera"))
 
     @property
+    def unique_id(self):
+        return str(uuid.uuid3(uuid.NAMESPACE_DNS, self.name + "@127.0.0.1"))
+
+    @property
     def description(self):
         return "Alpaca camera simulator that renders a sky image from live NINA mount/focus data"
 
@@ -116,7 +120,10 @@ class CameraDevice:
     def set_connected(self, value: bool):
         with self._lock:
             self._connected = bool(value)
-        if not value:
+        if value:
+            self.log("[camera] NINA connected (Alpaca camera in use)")
+        else:
+            self.log("[camera] NINA disconnected")
             self.abort_exposure()
 
     # ---- exposure --------------------------------------------------------
@@ -185,12 +192,19 @@ class CameraDevice:
             ra, dec = self.nina.get_mount_coordinates()
         except Exception as exc:
             raise RuntimeError(f"NINA UNAVAILABLE: {exc}") from exc
+        self.log(f"[camera] Mount coordinates: RA={float(ra):.4f} deg, Dec={float(dec):.4f} deg")
 
+        focus_live = True
         try:
             focus = self.nina.get_focus_position()
         except Exception as exc:
+            focus_live = False
             self.log(f"[camera] Focus position unavailable, using ideal focus ({exc})")
             focus = int(self.render_cfg.get("focus_ideal", 50000))
+        if focus_live:
+            self.log(f"[camera] Focuser: {focus}")
+        else:
+            self.log(f"[camera] Focuser: {focus} (fallback - NINA focus not available)")
 
         rc = self.render_cfg
         fov_x, fov_y = compute_fov_deg(width, height, self.pixel_size_um, self.focal_length_mm)
@@ -220,16 +234,18 @@ class CameraDevice:
             simulate_noise=bool(rc.get("simulate_noise", True)),
         )
         self.log(
-            f"[camera] Captured ra={float(ra):.4f} dec={float(dec):.4f} "
-            f"focus={focus} psf_sigma={sigma:.2f} fov={fov_x:.3f}x{fov_y:.3f}"
+            f"[camera] Image captured: RA={float(ra):.4f} deg, Dec={float(dec):.4f} deg, "
+            f"Focuser={focus}, psf_sigma={sigma:.2f} px, fov={fov_x:.3f}x{fov_y:.3f} deg"
         )
         return img
 
-    def image_array_b64(self) -> str:
+    def image_array_jagged(self) -> list:
+        """Return the 16-bit frame as a 2D jagged array ([row][col] = [Y][X]),
+        matching the ASCOM Alpaca ImageArray JSON convention."""
         with self._lock:
             if self._last_image is None:
                 raise RuntimeError("No image available")
-            return base64.b64encode(self._last_image.astype("<u2").tobytes()).decode("ascii")
+            return self._last_image.tolist()
 
     # ---- generic Alpaca property access ----------------------------------
     def get(self, prop: str):
@@ -252,10 +268,18 @@ class CameraDevice:
                 return self._connected
             if prop == "state":
                 return self.state
+            if prop == "camerastate":
+                return self.state
             if prop == "cameraxsize":
                 return self._sensor_w
             if prop == "cameraysize":
                 return self._sensor_h
+            if prop == "bitdepth":
+                return 16
+            if prop == "pixelsizex":
+                return self.pixel_size_um
+            if prop == "pixelsizey":
+                return self.pixel_size_um
             if prop == "numx":
                 return self.numx
             if prop == "numy":
@@ -297,25 +321,27 @@ class CameraDevice:
             if prop == "imageready":
                 return self._image_ready
             if prop == "imagearray":
-                return self.image_array_b64()
+                return self.image_array_jagged()
             if prop == "lastduration":
                 return self._last_duration
             if prop == "laststart":
                 return self._last_start or ""
             if prop == "gain":
-                return self.gain
+                return int(self.gain)
             if prop == "gainmin":
-                return float(c.get("gain_min", 0))
+                return int(c.get("gain_min", 0))
             if prop == "gainmax":
-                return float(c.get("gain_max", 300))
+                return int(c.get("gain_max", 300))
             if prop == "gainsetup":
                 return True
+            if prop == "gains":
+                return []
             if prop == "offset":
-                return self.offset
+                return int(self.offset)
             if prop == "offsetmin":
-                return float(c.get("offset_min", 0))
+                return int(c.get("offset_min", 0))
             if prop == "offsetmax":
-                return float(c.get("offset_max", 300))
+                return int(c.get("offset_max", 300))
             if prop == "offsetsetup":
                 return True
             if prop == "electronsperadu":
@@ -334,6 +360,12 @@ class CameraDevice:
                 return c.get("sensorname", "NINA Sim Sensor")
             if prop == "sensortype":
                 return SENSOR_TYPE.get(c.get("sensor_type", "mono"), 0)
+            if prop == "bayeroffsetx":
+                return 0
+            if prop == "bayeroffsety":
+                return 0
+            if prop == "canabortexposure":
+                return True
             if prop == "hasshutter":
                 return False
             if prop == "isshutteropen":
@@ -346,6 +378,12 @@ class CameraDevice:
                 return self.temp_setpoint + 0.4
             if prop == "temperature":
                 return self.temp_setpoint
+            if prop == "setccdtemperature":
+                return self.temp_setpoint
+            if prop == "cooleron":
+                return self.temp_setpoint < 0
+            if prop == "cangetcoolerpower":
+                return True
             if prop == "coolerpower":
                 return 55.0 if self.temp_setpoint < 0 else 0.0
             if prop == "heatcoolerpower":
@@ -385,6 +423,10 @@ class CameraDevice:
                 self.readout_mode = int(value)
             elif prop == "temperature":
                 self.temp_setpoint = float(value)
+            elif prop == "setccdtemperature":
+                self.temp_setpoint = float(value)
+            elif prop == "cooleron":
+                self.temp_setpoint = -5.0 if self._as_bool(value) else 0.0
             else:
                 raise KeyError(prop)
 
@@ -409,7 +451,11 @@ class AlpacaHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        pass
+        try:
+            # args = (requestline, status_code, protocol)
+            print(f"[http] {args[0]} -> {args[1] if len(args) > 1 else ''}")
+        except Exception:
+            pass
 
     @classmethod
     def _next_tid(cls):
@@ -438,6 +484,28 @@ class AlpacaHandler(BaseHTTPRequestHandler):
             if key.lower() == prop.lower():
                 return value
         return params.get("Value")
+
+    def _send_imagearray(self):
+        """Return ImageArray with the ASCOM ArrayType/Rank fields the client needs.
+
+        Type uses the ASCOM.Common.Alpaca.ArrayType enum: Unknown=0, Short=1,
+        Int=2, Double=3. Our 16-bit pixel values are sent as Int32 (Type=2),
+        matching the official ASCOM Alpaca camera simulator.
+        """
+        try:
+            value = self.device.image_array_jagged()
+        except Exception as exc:
+            return self._send_alpaca_error(0, str(exc))
+        sid = self._next_tid()
+        payload = {
+            "Value": value,
+            "Type": 2,  # ArrayType.Int
+            "Rank": 2,
+            "ClientTransactionID": self._cid,
+            "ServerTransactionID": sid,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        self._respond(200, body)
 
     def _send_json(self, value, cid=None, status: int = 200):
         if cid is None:
@@ -474,19 +542,24 @@ class AlpacaHandler(BaseHTTPRequestHandler):
     def _handle_management(self, method: str):
         device = self.device
         path = self.path.split("?", 1)[0]
-        if path == "/management/v1/description":
+        if path in ("/management/v1/description", "/management/description"):
             self._send_json({
-                "Name": device.name,
-                "Description": device.description,
-                "DriverInfo": device.driver_info,
-                "DriverVersion": device.driver_version,
-                "InterfaceVersion": device.interface_version,
-                "SupportedActions": [],
+                "ServerName": device.name,
+                "Manufacturer": "simulate_astro_images",
+                "ManufacturerVersion": device.driver_version,
+                "Location": "Earth",
             })
-        elif path == "/management/v1/configureddevices":
+        elif path in ("/management/v1/configureddevices", "/management/configureddevices"):
             self._send_json([
-                {"DeviceName": device.name, "DeviceType": "camera", "DeviceNumber": 0}
+                {
+                    "DeviceName": device.name,
+                    "DeviceType": "camera",
+                    "DeviceNumber": 0,
+                    "UniqueID": device.unique_id,
+                }
             ])
+        elif path in ("/management/v1/apiversions", "/management/apiversions"):
+            self._send_json([1])
         else:
             self._send_alpaca_error(0, f"Unknown management path: {path}")
 
@@ -503,6 +576,8 @@ class AlpacaHandler(BaseHTTPRequestHandler):
             return self._send_alpaca_error(0, "Missing property")
 
         if method == "GET":
+            if prop.lower() == "imagearray":
+                return self._send_imagearray()
             try:
                 value = device.get(prop)
             except KeyError:
@@ -511,13 +586,13 @@ class AlpacaHandler(BaseHTTPRequestHandler):
 
         params = self._read_form()
         try:
-            if prop.lower() == "exposurestart":
+            if prop.lower() in ("startexposure", "exposurestart"):
                 duration = params.get("Duration") or params.get("duration")
                 if duration is None:
                     duration = device.requested_duration
                 device.start_exposure(duration)
                 return self._send_json(None)
-            if prop.lower() == "exposureabort":
+            if prop.lower() in ("abortexposure", "exposureabort"):
                 device.abort_exposure()
                 return self._send_json(None)
             value = self._extract_value(params, prop)
@@ -529,7 +604,7 @@ class AlpacaHandler(BaseHTTPRequestHandler):
     # ---- entry points ----------------------------------------------------
     def _route(self, method: str):
         path = self.path.split("?", 1)[0]
-        if path.startswith("/management/v1/"):
+        if path.startswith("/management/"):
             self._handle_management(method)
         elif path.startswith("/api/v1/camera/"):
             self._handle_camera(method)

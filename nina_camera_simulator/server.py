@@ -53,8 +53,21 @@ def main() -> int:
 
     if args.probe:
         print(f"Probing NINA ninaAPI 2.0 at {nina.base_url} ...")
-        for key, value in nina.probe().items():
-            print(f"  {key}: {value}")
+        result = nina.probe()
+        for key in ("base_url", "mount_paths", "focus_paths",
+                    "mount_ra_deg", "mount_dec_deg", "focus_position"):
+            if key in result:
+                print(f"  {key}: {result[key]}")
+        for key in ("mount_error", "focus_error"):
+            if key in result:
+                print(f"  {key}: {result[key]}")
+        for key in ("mount_raw", "focus_raw"):
+            if key in result:
+                print(f"  --- {key} ---")
+                print(json.dumps(result[key], indent=2, ensure_ascii=False))
+        print("\nHint: run this twice while slewing the mount; if "
+              "mount_ra_deg/mount_dec_deg do not change, NINA's mount is not "
+              "connected or the wrong endpoint is being read.")
         return 0
 
     device = CameraDevice(camera_cfg, render_cfg, nina)

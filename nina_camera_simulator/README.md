@@ -69,9 +69,14 @@ visible on the image.
 - `server.host` / `server.port` – listen address of the Alpaca HTTP server.
 - `server.discovery_enabled` / `server.discovery_port` – ASCOM Alpaca dynamic
   discovery (UDP 32227) so the device appears in NINA's DeviceSelection browser.
-- `nina.base_url` – ninaAPI 2.0 plugin address (default `http://127.0.0.1:4557`).
-- `nina.mount_coordinates_path` / `focus_position_path` – primary endpoint; the
-  fallback lists are tried automatically if the primary 404s or fails.
+- `nina.base_url` – ninaAPI 2.0 plugin address. The default is
+  `http://127.0.0.1:4557`, but the plugin's port is configurable in NINA
+  (Options > Advanced API); set this to match your actual port
+  (e.g. `http://127.0.0.1:1888`).
+- `nina.mount_coordinates_path` / `focus_position_path` – primary endpoints.
+  ninaAPI 2.0 mounts under `/v2/api`, so the defaults are
+  `/v2/api/equipment/mount/info` and `/v2/api/equipment/focuser/info`; the
+  fallback lists cover older route layouts and are tried automatically.
 - `nina.ra_unit` – `auto` (a plain `ra` <= 24 is treated as hours), `hours`, or
   `degrees`.
 - `nina.api_key` – optional token sent as `X-Api-Key` if the plugin requires it.
@@ -83,11 +88,9 @@ visible on the image.
 
 ## Notes / assumptions
 
-- **ImageArray format**: the 16-bit frame is serialized row-major, x fastest,
-  little-endian unsigned 16-bit values, base64-encoded, with dimensions given by
-  the current `NumX`/`NumY`. This matches the ASCOM Alpaca convention; if an
-  image appears mirrored/rotated in NINA, only the ordering in
-  `CameraDevice.image_array_b64` needs adjusting.
+- **ImageArray format**: the 16-bit frame is returned as a 2D jagged integer
+  array in the JSON `Value` field (`[[row0...],[row1...]]`, i.e. `[Y][X]`), which
+  is the format the ASCOM Alpaca camera client (and NINA) expects.
 - **RA unit heuristic**: ninaAPI responses historically return RA in hours. In
   `auto` mode a plain `ra` key whose value is <= 24 is multiplied by 15.
   Override with `nina.ra_unit` if your setup differs.

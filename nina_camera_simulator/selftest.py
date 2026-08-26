@@ -20,6 +20,7 @@ import urllib.request
 import numpy as np
 
 from alpaca_camera import AlpacaDiscovery, CameraDevice, create_server
+from nina_client import _find_radec, _find_focus
 
 CAMERA_CFG = {
     "name": "Test Camera",
@@ -83,9 +84,10 @@ def http_put(url, form=None):
 
 
 def decode_image(b64: str, width: int, height: int) -> np.ndarray:
-    raw = np.frombuffer(base64.b64decode(b64), dtype="<u2")
-    assert raw.size == width * height, f"bad size: {raw.size} != {width * height}"
-    return raw.reshape(height, width)
+    """Decode a jagged-array ImageArray value into a 2D array."""
+    arr = np.asarray(b64, dtype=np.int32)  # b64 is the Value (list of lists)
+    assert arr.shape == (height, width), f"bad shape: {arr.shape}"
+    return arr.astype(np.uint16)
 
 
 def wait_image_ready(base, timeout=8.0):
@@ -106,15 +108,23 @@ def test_full_pipeline():
     base = f"http://127.0.0.1:{port}"
     try:
         info = http_get(f"{base}/management/v1/description")["Value"]
-        assert info["Name"] == "Test Camera"
+        assert info["ServerName"] == "Test Camera"
+        assert info["Manufacturer"]
+        apiversions = http_get(f"{base}/management/apiversions")["Value"]
+        assert 1 in apiversions, apiversions
         devs = http_get(f"{base}/management/v1/configureddevices")["Value"]
         assert devs[0]["DeviceType"] == "camera"
+        assert devs[0]["UniqueID"]
         print("  management API OK")
 
         http_put(f"{base}/api/v1/camera/0/connected", {"Connected": "true"})
         assert http_get(f"{base}/api/v1/camera/0/connected")["Value"] is True
         assert http_get(f"{base}/api/v1/camera/0/state")["Value"] == 0
         assert http_get(f"{base}/api/v1/camera/0/sensortype")["Value"] == 0
+        assert http_get(f"{base}/api/v1/camera/0/canabortexposure")["Value"] is True
+        assert http_get(f"{base}/api/v1/camera/0/bayeroffsetx")["Value"] == 0
+        assert http_get(f"{base}/api/v1/camera/0/gainmin")["Value"] == 0
+        assert http_get(f"{base}/api/v1/camera/0/gainmax")["Value"] == 300
 
         http_put(f"{base}/api/v1/camera/0/numx", {"NumX": "256"})
         http_put(f"{base}/api/v1/camera/0/numy", {"NumY": "256"})
@@ -123,7 +133,7 @@ def test_full_pipeline():
         assert http_get(f"{base}/api/v1/camera/0/gain")["Value"] == 120
         print("  property get/set OK")
 
-        http_put(f"{base}/api/v1/camera/0/exposurestart", {"Duration": "0.2"})
+        http_put(f"{base}/api/v1/camera/0/startexposure", {"Duration": "0.2", "Light": "true"})
         saw_exposing = False
         for _ in range(100):
             state = http_get(f"{base}/api/v1/camera/0/state")["Value"]
@@ -136,10 +146,12 @@ def test_full_pipeline():
         print("  exposure state machine OK")
 
         assert wait_image_ready(base), "image never became ready"
-        b64 = http_get(f"{base}/api/v1/camera/0/imagearray")["Value"]
-        img = decode_image(b64, 256, 256)
+        arr_resp = http_get(f"{base}/api/v1/camera/0/imagearray")
+        assert arr_resp["Type"] == 2, arr_resp.get("Type")
+        assert arr_resp["Rank"] == 2, arr_resp.get("Rank")
+        img = decode_image(arr_resp["Value"], 256, 256)
         assert img.max() > 30000, "image too dark - stars not rendered"
-        print(f"  exposure -> imagearray OK (max={int(img.max())})")
+        print(f"  exposure -> imagearray OK (Type={arr_resp['Type']}, max={int(img.max())})")
 
         dur = http_get(f"{base}/api/v1/camera/0/lastduration")["Value"]
         assert abs(dur - 0.2) < 1e-6
@@ -188,7 +200,47 @@ def test_discovery():
         discovery.stop()
 
 
+def test_nina_parse():
+    # Simulated response of GET /v2/api/equipment/mount/info (ninaAPI 2.0)
+    mount_info = {
+        "Response": {
+            "Name": "Telescope",
+            "RightAscension": 5.588,
+            "Declination": -5.3875,
+            "Coordinates": {
+                "RA": {"Radians": 0.09742, "Hours": 5.588, "Degree": 83.82},
+                "Dec": {"Radians": -0.09403, "Hours": -0.35917, "Degree": -5.3875},
+            },
+            "TargetCoordinates": {
+                "RA": {"Radians": 0.0, "Hours": 0.0, "Degree": 0.0},
+                "Dec": {"Radians": 0.0, "Hours": 0.0, "Degree": 0.0},
+            },
+            "Slewing": False,
+        },
+        "Success": True,
+    }
+    ra, dec = _find_radec(mount_info, "auto")
+    assert abs(ra - 83.82) < 1e-6, f"bad ra: {ra}"
+    assert abs(dec + 5.3875) < 1e-6, f"bad dec: {dec}"
+
+    # Coordinates-only variant (no top-level RightAscension/Declination)
+    coords_only = {"Response": {"Coordinates": mount_info["Response"]["Coordinates"]}}
+    ra2, dec2 = _find_radec(coords_only, "auto")
+    assert abs(ra2 - 83.82) < 1e-6 and abs(dec2 + 5.3875) < 1e-6
+
+    # Simple {ra, dec} in degrees
+    ra3, dec3 = _find_radec({"ra": 83.82, "dec": -5.3875}, "auto")
+    assert abs(ra3 - 83.82) < 1e-6 and abs(dec3 + 5.3875) < 1e-6
+
+    # Simulated response of GET /v2/api/equipment/focuser/info
+    focuser = {"Response": {"Name": "Focuser", "Position": 42123, "Connected": True}}
+    assert _find_focus(focuser) == 42123
+    print("  ninaAPI TelescopeInfo/FocuserInfo parsing OK")
+
+
 def main():
+    print("== test: ninaAPI response parsing ==")
+    test_nina_parse()
     print("== test: full Alpaca HTTP pipeline ==")
     test_full_pipeline()
     print("== test: NINA unavailable -> error overlay ==")

@@ -23,12 +23,36 @@ def _iter_dicts(obj):
             yield from _iter_dicts(item)
 
 
-def _find_radec(data, ra_unit: str) -> Optional[tuple[float, float]]:
-    """Recursively locate an {ra, dec} pair inside the JSON response.
+def _num(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
 
-    ra_unit: "hours" | "degrees" | "auto". In auto mode a plain "ra" key whose
-    absolute value is <= 24 is assumed to be hours (multiplied by 15); keys with
-    "deg" in the name are always degrees.
+
+def _angle_field(angle, *fields):
+    """Extract a numeric field from a NINA Angle dict (has Hours/Degree/Radians)."""
+    if isinstance(angle, dict):
+        low = {str(k).lower(): v for k, v in angle.items()}
+        for field in fields:
+            value = _num(low.get(field))
+            if value is not None:
+                return value
+    return None
+
+
+def _find_radec(data, ra_unit: str) -> Optional[tuple[float, float]]:
+    """Recursively locate the mount's current RA/Dec inside the JSON response.
+
+    Understands the shapes returned by ninaAPI 2.0:
+      - NINA TelescopeInfo: top-level "RightAscension" (hours) + "Declination"
+        (degrees), plus a "Coordinates" object with nested Angle dicts
+        {Radians, Hours, Degree, ...}.
+      - Simple objects like {"ra": ..., "dec": ...}.
+
+    ra_unit: "hours" | "degrees" | "auto". In auto mode a plain "ra" whose
+    absolute value is <= 24 is assumed to be hours (x15); keys containing "deg"
+    are always degrees. NINA's "RightAscension"/"Coordinates.RA.Hours" are
+    always treated as hours.
     """
     ra_names = (
         "ra", "rightascension", "ra_deg", "radegrees", "ra_hours", "rahours",
@@ -42,19 +66,34 @@ def _find_radec(data, ra_unit: str) -> Optional[tuple[float, float]]:
     for d in _iter_dicts(data):
         keys = {str(k).lower(): v for k, v in d.items()}
 
+        # 1) NINA Coordinates object: {"Coordinates": {"RA": {...}, "Dec": {...}}}
+        coords = keys.get("coordinates")
+        if isinstance(coords, dict):
+            ck = {str(k).lower(): v for k, v in coords.items()}
+            ra_hours = _angle_field(ck.get("ra"), "hours", "degree", "radians")
+            dec_deg = _angle_field(ck.get("dec"), "degree", "radians")
+            if ra_hours is not None and dec_deg is not None:
+                return ra_hours * 15.0, dec_deg
+
+        # 2) NINA TelescopeInfo top-level: RightAscension (hours) + Declination
+        ra = _num(keys.get("rightascension"))
+        dec = _num(keys.get("declination"))
+        if ra is not None and dec is not None:
+            return ra * 15.0, dec
+
+        # 3) plain ra/dec keys
         ra = None
         ra_key = None
         for name in ra_names:
-            if name in keys and isinstance(keys[name], (int, float)):
+            if name in keys and _num(keys[name]) is not None:
                 ra = float(keys[name])
                 ra_key = name
                 break
         if ra is None:
             continue
-
         dec = None
         for name in dec_names:
-            if name in keys and isinstance(keys[name], (int, float)):
+            if name in keys and _num(keys[name]) is not None:
                 dec = float(keys[name])
                 break
         if dec is None:
@@ -104,12 +143,13 @@ class NinaClient:
         self.api_key = api_key
         self.timeout = timeout
         self.mount_paths = mount_paths or [
+            "/v2/api/equipment/mount/info",
+            "/v2/api/equipment/telescope/info",
             "/api/v2/mount/coordinates",
             "/api/v2/mount",
-            "/api/v2/telescope/coordinates",
-            "/api/v2/telescope",
         ]
         self.focus_paths = focus_paths or [
+            "/v2/api/equipment/focuser/info",
             "/api/v2/focuser/position",
             "/api/v2/focuser",
         ]
@@ -161,16 +201,28 @@ class NinaClient:
         return found
 
     def probe(self) -> dict:
-        """Try both data sources and report what is reachable."""
-        out = {"base_url": self.base_url}
+        """Try both data sources, report reachability + parsed values + raw JSON."""
+        out = {"base_url": self.base_url, "mount_paths": list(self.mount_paths),
+               "focus_paths": list(self.focus_paths)}
         try:
-            ra, dec = self.get_mount_coordinates()
-            out["mount_ra_deg"] = round(ra, 4)
-            out["mount_dec_deg"] = round(dec, 4)
+            data = self._first_ok(self.mount_paths)
+            out["mount_raw"] = data
+            ra, dec = _find_radec(data, self.ra_unit)
+            if ra is None:
+                out["mount_error"] = f"No RA/Dec found in response: {data!r}"
+            else:
+                out["mount_ra_deg"] = round(ra, 4)
+                out["mount_dec_deg"] = round(dec, 4)
         except NinaError as exc:
             out["mount_error"] = str(exc)
         try:
-            out["focus_position"] = self.get_focus_position()
+            data = self._first_ok(self.focus_paths)
+            out["focus_raw"] = data
+            focus = _find_focus(data)
+            if focus is None:
+                out["focus_error"] = f"No focuser position found in response: {data!r}"
+            else:
+                out["focus_position"] = focus
         except NinaError as exc:
             out["focus_error"] = str(exc)
         return out

@@ -6,13 +6,13 @@
     "discovery_port": 32227
   },
   "nina": {
-    "base_url": "http://127.0.0.1:4557",
+    "base_url": "http://127.0.0.1:1888",
     "api_key": "",
     "timeout_seconds": 3.0,
-    "mount_coordinates_path": "/api/v2/mount/coordinates",
-    "mount_fallback_paths": ["/api/v2/mount", "/api/v2/telescope/coordinates", "/api/v2/telescope"],
-    "focus_position_path": "/api/v2/focuser/position",
-    "focus_fallback_paths": ["/api/v2/focuser"],
+    "mount_coordinates_path": "/v2/api/equipment/mount/info",
+    "mount_fallback_paths": ["/v2/api/equipment/telescope/info", "/api/v2/mount/coordinates", "/api/v2/mount"],
+    "focus_position_path": "/v2/api/equipment/focuser/info",
+    "focus_fallback_paths": ["/api/v2/focuser/position", "/api/v2/focuser"],
     "ra_unit": "auto"
   },
   "camera": {
