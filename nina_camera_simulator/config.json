@@ -40,11 +40,11 @@
     "tone_gain": 2.0,
     "psf_sigma_min": 0.8,
     "psf_sigma_max": 8.0,
-    "focus_ideal": 50000,
-    "focus_span": 100000,
+    "focus_ideal": 0,
+    "focus_span": 1000,
     "brightness": 40000,
     "bias": 1200,
-    "simulate_noise": true,
+    "simulate_noise": false,
     "noise_sigma": 40.0,
     "vignetting": 0.35
   }

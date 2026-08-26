@@ -46,7 +46,7 @@ RENDER_CFG = {
     "focus_span": 100000,
     "brightness": 40000,
     "bias": 1200,
-    "simulate_noise": True,
+    "simulate_noise": False,
     "noise_sigma": 40.0,
     "vignetting": 0.0,
 }
@@ -238,9 +238,47 @@ def test_nina_parse():
     print("  ninaAPI TelescopeInfo/FocuserInfo parsing OK")
 
 
+def test_focus_calibration():
+    from alpaca_camera import CameraDevice
+    from image_renderer import focus_to_psf_sigma
+
+    class FocusStub:
+        def __init__(self, focus):
+            self.focus = focus
+
+        def get_mount_coordinates(self):
+            return 83.82, -5.3875
+
+        def get_focus_position(self):
+            return self.focus
+
+    render_cfg = dict(RENDER_CFG)
+    render_cfg["focus_span"] = 1000
+    render_cfg["psf_sigma_min"] = 0.8
+    render_cfg["psf_sigma_max"] = 8.0
+
+    # First exposure calibrates ideal focus from the first focuser position
+    device = CameraDevice(CAMERA_CFG, render_cfg, FocusStub(40000))
+    assert device._focus_ideal is None
+    device.start_exposure(0.0)
+    deadline = time.monotonic() + 8.0
+    while not device.image_ready and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert device._focus_ideal == 40000, device._focus_ideal
+    # At ideal focus the image is sharpest
+    sharp = focus_to_psf_sigma(40000, device._focus_ideal, 1000, 0.8, 8.0)
+    assert abs(sharp - 0.8) < 1e-9
+    # ±1000 steps away reaches maximum blur
+    max_blur = focus_to_psf_sigma(41000, device._focus_ideal, 1000, 0.8, 8.0)
+    assert abs(max_blur - 8.0) < 1e-9
+    print("  focus auto-calibration OK (ideal=40000, blur range ±1000)")
+
+
 def main():
     print("== test: ninaAPI response parsing ==")
     test_nina_parse()
+    print("== test: focus auto-calibration ==")
+    test_focus_calibration()
     print("== test: full Alpaca HTTP pipeline ==")
     test_full_pipeline()
     print("== test: NINA unavailable -> error overlay ==")

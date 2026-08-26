@@ -62,6 +62,7 @@ class CameraDevice:
         self._requested_duration = 0.0
         self._thread = None
         self._abort = threading.Event()
+        self._focus_ideal = None  # auto-calibrated on first focuser read
 
         try:
             self._catalog = get_catalog(render_cfg)
@@ -197,10 +198,15 @@ class CameraDevice:
         focus_live = True
         try:
             focus = self.nina.get_focus_position()
+            if self._focus_ideal is None:
+                self._focus_ideal = focus
+                self.log(f"[camera] Focuser first read - ideal focus set to {focus}")
         except Exception as exc:
             focus_live = False
             self.log(f"[camera] Focus position unavailable, using ideal focus ({exc})")
-            focus = int(self.render_cfg.get("focus_ideal", 50000))
+            focus = self._focus_ideal if self._focus_ideal is not None else int(
+                self.render_cfg.get("focus_ideal", 0)
+            )
         if focus_live:
             self.log(f"[camera] Focuser: {focus}")
         else:
@@ -208,10 +214,13 @@ class CameraDevice:
 
         rc = self.render_cfg
         fov_x, fov_y = compute_fov_deg(width, height, self.pixel_size_um, self.focal_length_mm)
+        focus_ideal = self._focus_ideal if self._focus_ideal is not None else int(
+            rc.get("focus_ideal", 0)
+        )
         sigma = focus_to_psf_sigma(
             focus,
-            int(rc.get("focus_ideal", 50000)),
-            int(rc.get("focus_span", 100000)),
+            focus_ideal,
+            int(rc.get("focus_span", 1000)),
             float(rc.get("psf_sigma_min", 0.8)),
             float(rc.get("psf_sigma_max", 8.0)),
         )
@@ -231,7 +240,7 @@ class CameraDevice:
             bias=float(rc.get("bias", 1200.0)),
             noise_sigma=float(rc.get("noise_sigma", 40.0)),
             vignetting=float(rc.get("vignetting", 0.35)),
-            simulate_noise=bool(rc.get("simulate_noise", True)),
+            simulate_noise=bool(rc.get("simulate_noise", False)),
         )
         self.log(
             f"[camera] Image captured: RA={float(ra):.4f} deg, Dec={float(dec):.4f} deg, "

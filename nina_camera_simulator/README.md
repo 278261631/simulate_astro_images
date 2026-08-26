@@ -83,8 +83,10 @@ visible on the image.
 - `camera.*` – sensor size, pixel size, focal length (defines the field of view),
   gain/offset/exposure limits, readout modes.
 - `render.*` – catalog path, magnitude limit, roll, tone-mapping gain, and the
-  **focus → PSF blur** mapping (`focus_ideal` = sharpest position, `focus_span` =
-  defocus distance at which blur is maximum).
+  **focus → PSF blur** mapping. `focus_ideal` is auto-calibrated: the focuser
+  position read the first time the focuser is polled becomes the sharpest
+  focus, and stars reach maximum blur (`psf_sigma_max`) when the focuser moves
+  `focus_span` (±1000 by default) steps away from it.
 
 ## Notes / assumptions
 

@@ -143,7 +143,7 @@ def to_raw16(
     bias: float = 1200.0,
     noise_sigma: float = 40.0,
     vignetting: float = 0.35,
-    simulate_noise: bool = True,
+    simulate_noise: bool = False,
     seed=None,
 ) -> np.ndarray:
     """Turn a [0,1] luminance image into a 16-bit sensor frame.
