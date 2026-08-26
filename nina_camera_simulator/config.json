@@ -1,0 +1,51 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 11111,
+    "discovery_enabled": true,
+    "discovery_port": 32227
+  },
+  "nina": {
+    "base_url": "http://127.0.0.1:4557",
+    "api_key": "",
+    "timeout_seconds": 3.0,
+    "mount_coordinates_path": "/api/v2/mount/coordinates",
+    "mount_fallback_paths": ["/api/v2/mount", "/api/v2/telescope/coordinates", "/api/v2/telescope"],
+    "focus_position_path": "/api/v2/focuser/position",
+    "focus_fallback_paths": ["/api/v2/focuser"],
+    "ra_unit": "auto"
+  },
+  "camera": {
+    "name": "NINA Simulated Alpaca Camera",
+    "sensor_type": "mono",
+    "numx": 1024,
+    "numy": 1024,
+    "pixel_size_um": 3.75,
+    "focal_length_mm": 500.0,
+    "gain_default": 100,
+    "gain_min": 0,
+    "gain_max": 300,
+    "offset_default": 50,
+    "offset_min": 0,
+    "offset_max": 300,
+    "exposure_min": 0.001,
+    "exposure_max": 3600.0,
+    "exposure_resolution": 0.001,
+    "readout_modes": ["Default", "Low Noise"]
+  },
+  "render": {
+    "catalog": "../data/hip_catalog.csv",
+    "max_mag": 12.0,
+    "roll_deg": 0.0,
+    "tone_gain": 2.0,
+    "psf_sigma_min": 0.8,
+    "psf_sigma_max": 8.0,
+    "focus_ideal": 50000,
+    "focus_span": 100000,
+    "brightness": 40000,
+    "bias": 1200,
+    "simulate_noise": true,
+    "noise_sigma": 40.0,
+    "vignetting": 0.35
+  }
+}
