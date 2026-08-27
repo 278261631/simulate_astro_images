@@ -1,0 +1,78 @@
+name: Release render_sky_patch.exe
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty for auto)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Compile
+        shell: msys2 {0}
+        run: g++ -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -o cpp/render_sky_patch.exe cpp/render_sky_patch.cpp
+
+      - name: Smoke test
+        shell: msys2 {0}
+        run: |
+          mkdir -p cpp/test_outputs
+          ./cpp/render_sky_patch.exe --out cpp/test_outputs/default.bmp
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="manual-$(echo ${{ github.sha }} | cut -c1-8)"
+            fi
+            echo "name=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging/data, dist | Out-Null
+          Copy-Item cpp/render_sky_patch.exe staging/render_sky_patch.exe
+          Copy-Item data/hip_catalog.csv staging/data/hip_catalog.csv
+          Get-ChildItem cpp/test_outputs/*.bmp | Select-Object -First 1 | Copy-Item -Destination staging/sample_output.bmp
+          Compress-Archive -Path staging/* -DestinationPath dist/render_sky_patch_win64.zip -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          body: |
+            Windows 64-bit standalone build of `render_sky_patch.exe` (statically linked, no DLL dependencies).
+
+            **Usage** — unzip, then run from the extracted folder:
+            ```
+            render_sky_patch.exe --out m42.bmp
+            ```
+            `data/hip_catalog.csv` is included. Options: `--ra`, `--dec`, `--fov`, `--roll`, `--psf-sigma`, `--gain`, `--size`, `--dpi`, `--max-mag`.
+          files: |
+            dist/render_sky_patch_win64.zip
+            cpp/render_sky_patch.exe
+          generate_release_notes: true
