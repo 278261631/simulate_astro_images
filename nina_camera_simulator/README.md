@@ -45,7 +45,7 @@ python server.py --port 11112          # override
 
 # 3. In NINA:
 #    Equipment > Camera > add device type "Alpaca Camera"
-#    - Browse (DeviceSelection) should now list "NINA Simulated Alpaca Camera"
+#    - Browse (DeviceSelection) should now list "Simulate-Alpaca-Cam"
 #      automatically (UDP discovery on port 32227), or
 #    - enter the address manually:  http://127.0.0.1:11111/api/v1/camera/0
 #    Connect and expose.

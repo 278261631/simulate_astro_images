@@ -73,7 +73,7 @@ class CameraDevice:
     # ---- identity (also used by the management API) ---------------------
     @property
     def name(self):
-        return str(self.cfg.get("name", "NINA Simulated Alpaca Camera"))
+        return str(self.cfg.get("name", "Simulate-Alpaca-Cam"))
 
     @property
     def unique_id(self):

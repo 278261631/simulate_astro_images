@@ -16,7 +16,7 @@
     "ra_unit": "auto"
   },
   "camera": {
-    "name": "NINA Simulated Alpaca Camera",
+    "name": "Simulate-Alpaca-Cam",
     "sensor_type": "mono",
     "numx": 1024,
     "numy": 1024,
