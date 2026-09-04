@@ -11,7 +11,6 @@ import argparse
 import math
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -283,6 +282,8 @@ def main() -> None:
 
     out_path = build_output_path(args.out, args.ra, args.dec, args.fov, args.roll)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    import matplotlib.pyplot as plt  # noqa: PLC0415  (lazy: keep module import-light for the GUI)
+
     plt.imsave(out_path, image)
 
     print(f"Saved image: {out_path.resolve()}")
