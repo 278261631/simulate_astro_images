@@ -33,12 +33,14 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -55,6 +57,7 @@ from render_sky_patch import (  # noqa: E402
     load_catalog,
     render_psf_image,
 )
+import sky_effects  # noqa: E402
 
 DEFAULT_CATALOG = SCRIPT_DIR.parent / "data" / "hip_catalog.csv"
 DEFAULT_RA = 83.82  # M42
@@ -62,6 +65,36 @@ DEFAULT_DEC = -5.3875
 DEFAULT_FOV = 30.0
 
 OVERVIEW_MAG = 6.5  # stars shown on the all-sky map
+
+# Effect name -> parameter controls that should grey out when the effect is off.
+ART_PARAM_MAP = {
+    "noise": ("noise_sigma", "noise_bias"),
+    "cr": ("cr_count",),
+    "meteor": ("meteor_count",),
+    "dust": ("dust_count", "dust_size"),
+    "seeing": ("seeing_sigma",),
+    "spike": ("spike_len", "spike_int"),
+    "ghost": ("ghost_int",),
+}
+
+
+def _make_ispin(parent, lo: int, hi: int, step: int, val: int) -> QSpinBox:
+    s = QSpinBox(parent)
+    s.setRange(lo, hi)
+    s.setSingleStep(step)
+    s.setValue(val)
+    return s
+
+
+def _make_fspin(
+    parent, lo: float, hi: float, decimals: int, step: float, val: float
+) -> QDoubleSpinBox:
+    s = QDoubleSpinBox(parent)
+    s.setRange(lo, hi)
+    s.setDecimals(decimals)
+    s.setSingleStep(step)
+    s.setValue(val)
+    return s
 
 # --------------------------------------------------------------------------
 # Small astro / coordinate helpers
@@ -579,7 +612,10 @@ class SkyPatchGui(QMainWindow):
         self._token = 0
         self._busy = False
         self._need_render = False
+        self._frame = 0  # exposure counter for per-frame random artifacts
         self._current_image: QImage | None = None
+        self._art_check: dict = {}
+        self._art_param_ids: dict = {}
 
         self._bridge = _SignalBridge()
         self._bridge.done.connect(self._on_render_done)
@@ -601,10 +637,9 @@ class SkyPatchGui(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # --- left control panel -------------------------------------------
-        left = QWidget(central)
+        # --- left control panel (scrollable) -------------------------------
+        left = QWidget()
         left.setMinimumWidth(330)
-        left.setMaximumWidth(400)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
 
@@ -696,6 +731,9 @@ class SkyPatchGui(QMainWindow):
         oform.addRow("Gain", self.spin_gain)
         left_layout.addWidget(opt_box)
 
+        # Artifact simulations group
+        self._build_artifact_group(left)
+
         # Actions
         btn_row = QHBoxLayout()
         self.check_live = QCheckBox("Live update", left)
@@ -709,8 +747,9 @@ class SkyPatchGui(QMainWindow):
         left_layout.addWidget(self.btn_save)
 
         tip = QLabel(
-            "Tip: wheel zooms the preview, drag pans, "
-            "click re-points the telescope.",
+            "Tip: wheel zooms the preview, drag pans, click re-points. "
+            "Transient artifacts (noise / cosmic rays / meteors) re-roll on "
+            "every new exposure; dust / spikes / ghosts stay fixed per seed.",
             left,
         )
         tip.setWordWrap(True)
@@ -718,7 +757,13 @@ class SkyPatchGui(QMainWindow):
         left_layout.addWidget(tip)
         left_layout.addStretch(1)
 
-        root.addWidget(left)
+        scroll = QScrollArea(central)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(352)
+        scroll.setMaximumWidth(430)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(left)
+        root.addWidget(scroll)
 
         # --- preview panel -------------------------------------------------
         right = QWidget(central)
@@ -737,6 +782,146 @@ class SkyPatchGui(QMainWindow):
             w.setContentsMargins(8, 0, 8, 0)
             self.status.addPermanentWidget(w)
         self._s_render.setText("catalog: loading \u2026")
+
+    def _build_artifact_group(self, left: QWidget) -> None:
+        """Checkboxes + parameter spins for the simulated imaging artifacts."""
+        group = QGroupBox("Simulated artifacts", left)
+        grid = QGridLayout(group)
+        grid.setColumnStretch(1, 1)
+
+        grid.addWidget(QLabel("Random seed", group), 0, 0)
+        self.spin_seed = _make_ispin(group, 0, 999999, 1, 0)
+        grid.addWidget(self.spin_seed, 0, 1)
+        self.btn_roll_seed = QPushButton("Roll", group)
+        self.btn_roll_seed.setToolTip("Pick a new random seed (re-rolls fixed artifacts)")
+        grid.addWidget(self.btn_roll_seed, 0, 2)
+
+        row = 1
+
+        def effect(key: str, title: str, controls) -> None:
+            nonlocal row
+            check = QCheckBox(title, group)
+            self._art_check[key] = check
+            grid.addWidget(check, row, 0)
+            row_params = []
+            lay = QHBoxLayout()
+            for label_text, widget in controls:
+                lay.addWidget(QLabel(label_text, group))
+                lay.addWidget(widget)
+                row_params.append(widget)
+            lay.addStretch(1)
+            grid.addLayout(lay, row, 1, 1, 2)
+            self._art_param_ids[key] = row_params
+            row += 1
+
+        effect(
+            "noise",
+            "Noise (bias + random)",
+            [
+                ("\u03c3", _make_fspin(group, 0.0, 0.15, 3, 0.005, 0.02)),
+                ("bias", _make_fspin(group, 0.0, 0.5, 3, 0.01, 0.05)),
+            ],
+        )
+        effect(
+            "cr",
+            "Cosmic rays",
+            [("count", _make_ispin(group, 0, 300, 5, 10))],
+        )
+        effect(
+            "meteor",
+            "Meteor trail",
+            [("count", _make_ispin(group, 0, 5, 1, 1))],
+        )
+        effect(
+            "dust",
+            "CMOS dust specks",
+            [
+                ("count", _make_ispin(group, 0, 60, 1, 6)),
+                ("size%", _make_fspin(group, 0.0, 12.0, 1, 0.5, 3.0)),
+            ],
+        )
+        effect(
+            "seeing",
+            "Atmospheric seeing",
+            [("px", _make_fspin(group, 0.0, 8.0, 2, 0.1, 1.5))],
+        )
+        effect(
+            "spike",
+            "Diffraction spikes",
+            [
+                ("len%", _make_fspin(group, 0.0, 45.0, 0, 1.0, 12.0)),
+                ("int", _make_fspin(group, 0.0, 3.0, 1, 0.1, 1.0)),
+            ],
+        )
+        effect(
+            "ghost",
+            "Ghost reflections",
+            [("int", _make_fspin(group, 0.0, 1.5, 2, 0.05, 0.5))],
+        )
+
+        left_layout = left.layout()
+        left_layout.addWidget(group)
+        self._refresh_art_widget_enabled()
+
+    def _artifact_settings(self) -> dict:
+        """Read the artifact UI into the flat config dict used by sky_effects."""
+        def widget(key: str):
+            return self._art_check[key]
+
+        def param_widgets(key: str):
+            return self._art_param_ids[key]
+
+        def is_on(key: str) -> bool:
+            return widget(key).isChecked()
+
+        def fval(spin: QDoubleSpinBox) -> float:
+            return float(spin.value())
+
+        def ival(spin: QSpinBox) -> int:
+            return int(spin.value())
+
+        art = {
+            "noise": is_on("noise"),
+            "noise_sigma": fval(param_widgets("noise")[0]),
+            "noise_bias": fval(param_widgets("noise")[1]),
+            "cr": is_on("cr"),
+            "cr_count": ival(param_widgets("cr")[0]),
+            "meteor": is_on("meteor"),
+            "meteor_count": ival(param_widgets("meteor")[0]),
+            "dust": is_on("dust"),
+            "dust_count": ival(param_widgets("dust")[0]),
+            "dust_size": fval(param_widgets("dust")[1]) / 100.0,
+            "seeing": is_on("seeing"),
+            "seeing_sigma": fval(param_widgets("seeing")[0]),
+            "spike": is_on("spike"),
+            "spike_len": fval(param_widgets("spike")[0]) / 100.0,
+            "spike_int": fval(param_widgets("spike")[1]),
+            "ghost": is_on("ghost"),
+            "ghost_int": fval(param_widgets("ghost")[0]),
+            "seed": int(self.spin_seed.value()),
+        }
+        return art
+
+    def _refresh_art_widget_enabled(self) -> None:
+        if not hasattr(self, "_art_check"):
+            return
+        for key, params in self._art_param_ids.items():
+            enabled = self._art_check[key].isChecked()
+            for spin in params:
+                spin.setEnabled(enabled)
+
+    def _on_artifact_toggled(self, *_args) -> None:
+        self._refresh_art_widget_enabled()
+        self._schedule_render()
+
+    def _on_artifact_changed(self, *_args) -> None:
+        self._schedule_render()
+
+    def _roll_seed(self) -> None:
+        import random as _random
+
+        self.spin_seed.setValue(_random.randrange(0, 1000000))
+        self._force_render()
 
     # -- data & signals -----------------------------------------------------
     def _load_catalog(self) -> None:
@@ -770,6 +955,15 @@ class SkyPatchGui(QMainWindow):
             self.spin_gain,
         ):
             spin.valueChanged.connect(self._on_param_changed)
+
+        # artifact simulation widgets
+        for key, check in self._art_check.items():
+            check.toggled.connect(self._on_artifact_toggled)
+        for params in self._art_param_ids.values():
+            for spin in params:
+                spin.valueChanged.connect(self._on_artifact_changed)
+        self.spin_seed.valueChanged.connect(self._on_artifact_changed)
+        self.btn_roll_seed.clicked.connect(self._roll_seed)
 
         self.check_live.toggled.connect(self._on_live_toggled)
         self.btn_render.clicked.connect(self._force_render)
@@ -847,6 +1041,10 @@ class SkyPatchGui(QMainWindow):
             self._need_render = True  # newest request will win when we are free
             return
         snap = self._params_snapshot()
+        self._frame += 1  # each produced image is a fresh "exposure"
+        art = self._artifact_settings()
+        art["frame"] = self._frame
+        snap["art"] = art
         w, h = snap["width"], snap["height"]
         self._s_render.setText(f"rendering {w}\u00d7{h} \u2026")
         self.status.showMessage("Rendering \u2026")
@@ -860,20 +1058,33 @@ class SkyPatchGui(QMainWindow):
         try:
             t0 = time.perf_counter()
             rgb, stars = self._compute_image(snap)
+            rgb = sky_effects.apply_effects(rgb, stars, snap.get("art") or {})
             dt = time.perf_counter() - t0
             qimage = rgb_to_qimage(rgb)
         except Exception as exc:  # noqa: BLE001 - report back to GUI thread
             self._bridge.done.emit({"ok": False, "token": token, "error": str(exc)})
             return
         self._bridge.done.emit(
-            {"ok": True, "token": token, "image": qimage, "stars": stars, "dt": dt}
+            {
+                "ok": True,
+                "token": token,
+                "image": qimage,
+                "stars": stars["count"],
+                "dt": dt,
+            }
         )
 
-    def _compute_image(self, snap: dict) -> tuple[np.ndarray, int]:
-        """Pure-numpy render; mirrors render_sky_patch.main() exactly."""
+    def _compute_image(self, snap: dict) -> tuple[np.ndarray, dict]:
+        """Pure-numpy render; mirrors render_sky_patch.main() exactly.
+
+        Returns the float RGB image plus the projected star pixel info that
+        the artifact simulator needs (spikes / ghosts use star positions).
+        """
         ra_all, dec_all, mag_all = self._catalog
         max_mag = snap["max_mag"]
         ra0, dec0, fov = snap["ra"], snap["dec"], snap["fov"]
+        width_px = int(snap["width"])
+        height_px = int(snap["height"])
 
         mask = mag_all <= max_mag
         ra, dec, mag = ra_all[mask], dec_all[mask], mag_all[mask]
@@ -896,12 +1107,27 @@ class SkyPatchGui(QMainWindow):
             y=y,
             mag=mag,
             half_extent=half_extent,
-            width_px=snap["width"],
-            height_px=snap["height"],
+            width_px=width_px,
+            height_px=height_px,
             psf_sigma=snap["psf_sigma"],
             gain=snap["gain"],
         )
-        return rgb, int(len(mag))
+
+        # Pixel-space star coordinates + flux (for artifact overlays).
+        xp = (x + half_extent) / (2.0 * half_extent) * (width_px - 1)
+        yp = (half_extent - y) / (2.0 * half_extent) * (height_px - 1)
+        on_frame = (
+            (xp >= 0) & (xp < width_px) & (yp >= 0) & (yp < height_px)
+        )
+        flux = np.clip(np.power(10.0, -0.4 * (mag - 8.0)), 0.03, 80.0)
+        stars = {
+            "x": np.asarray(xp[on_frame], dtype=np.float64),
+            "y": np.asarray(yp[on_frame], dtype=np.float64),
+            "flux": np.asarray(flux[on_frame], dtype=np.float64),
+            "mag": np.asarray(mag[on_frame], dtype=np.float64),
+            "count": int(len(mag)),
+        }
+        return rgb, stars
 
     def _on_render_done(self, payload: dict) -> None:
         self._busy = False
