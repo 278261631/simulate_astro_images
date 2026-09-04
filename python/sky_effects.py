@@ -21,6 +21,11 @@ import math
 
 import numpy as np
 
+try:  # optional: large speed-up for Gaussian blur / streak painting
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - cv2 not installed
+    cv2 = None
+
 DEFAULT_DUST_SIZE = 0.03  # each speck radius as a fraction of the short image side
 
 
@@ -37,6 +42,14 @@ def blur_image(image: np.ndarray, sigma: float) -> np.ndarray:
     """Separable edge-clamped Gaussian blur; works for (H, W) or (H, W, C)."""
     if sigma <= 0.0:
         return image
+    if cv2 is not None and image.ndim == 3:
+        ksize = max(3, int(round(6.0 * sigma)) | 1)
+        return cv2.GaussianBlur(
+            np.ascontiguousarray(image, dtype=np.float32),
+            (ksize, ksize),
+            float(sigma),
+            borderType=cv2.BORDER_REPLICATE,
+        )
     kernel = gaussian_kernel1d(sigma)
     radius = len(kernel) // 2
     result = image.astype(np.float32, copy=True)
@@ -80,12 +93,10 @@ def _additive_mask_to_rgb(image: np.ndarray, mask: np.ndarray, weights: tuple[fl
 
 def add_sensor_noise(image: np.ndarray, sigma: float, bias: float, seed: int, frame: int) -> None:
     """Bias background + random (read) noise. Bias is per-pixel offset too."""
-    rng = _transient_rng(seed, frame)
+    state = (seed * 1000003 + frame * 1103515245) & 0xFFFFFFFF
+    rng = np.random.default_rng(state)
     h, w = image.shape[:2]
-    if bias > 0.0:
-        noise = rng.normal(bias, sigma, size=(h, w)).astype(np.float32)
-    else:
-        noise = rng.normal(0.0, sigma, size=(h, w)).astype(np.float32)
+    noise = rng.normal(bias, sigma, size=(h, w)).astype(np.float32)
     _additive_mask_to_rgb(image, noise, (1.0, 1.0, 1.0))
 
 
@@ -122,6 +133,41 @@ def add_cosmic_rays(image: np.ndarray, count: int, seed: int, frame: int) -> Non
         )[None, :]
 
 
+def _paint_streak(
+    image: np.ndarray,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    sigma: float,
+    weights_at_t: callable,
+    color: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> None:
+    """Add a tapered/straight streak by sampling the segment every 0.5 px."""
+    h, w = image.shape[:2]
+    seg_x = p1[0] - p0[0]
+    seg_y = p1[1] - p0[1]
+    length = math.hypot(seg_x, seg_y)
+    if length < 1.0:
+        return
+    ux = seg_x / length
+    uy = seg_y / length
+    n = int(math.ceil(length / 0.5))
+    t = np.linspace(0.0, 1.0, n)
+    cx = p0[0] + seg_x * t
+    cy = p0[1] + seg_y * t
+    weight = weights_at_t(t)  # per-sample amplitude (1D float)
+    sigma = max(0.3, float(sigma))
+    max_off = int(math.ceil(3.0 * sigma))
+    mask = np.zeros((h, w), dtype=np.float32)
+    for d in range(-max_off, max_off + 1):
+        wd = weight * float(math.exp(-0.5 * (d / sigma) ** 2))
+        rows = np.rint(cy + uy * d).astype(np.int64)
+        cols = np.rint(cx + ux * d).astype(np.int64)
+        ok = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+        if ok.any():
+            np.add.at(mask, (rows[ok], cols[ok]), wd[ok].astype(np.float32))
+    _additive_mask_to_rgb(image, mask, color)
+
+
 def add_meteor_trail(image: np.ndarray, count: int, seed: int, frame: int) -> None:
     """Bright tapered trails across the field (meteor transients)."""
     rng = _transient_rng(seed * 7 + 2, frame)
@@ -129,24 +175,14 @@ def add_meteor_trail(image: np.ndarray, count: int, seed: int, frame: int) -> No
     diag = math.hypot(w, h)
     for _ in range(count):
         p0, p1 = _random_edge_points(rng, w, h)
-        seg_x = p1[0] - p0[0]
-        seg_y = p1[1] - p0[1]
-        if math.hypot(seg_x, seg_y) < 0.4 * diag:
+        if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) < 0.4 * diag:
             continue
-        mask = np.zeros((h, w), dtype=np.float32)
-        gx, gy = np.meshgrid(np.arange(w), np.arange(h))
-        dx = gx - p0[0]
-        dy = gy - p0[1]
-        denom = seg_x * seg_x + seg_y * seg_y
-        t = np.clip((dx * seg_x + dy * seg_y) / denom, 0.0, 1.0)
-        px = dx - t * seg_x
-        py = dy - t * seg_y
-        dist2 = px * px + py * py
-        sigma_w = max(0.8, math.hypot(seg_x, seg_y) / 900.0 + 0.6)
-        fall = (1.0 - t) ** 1.6
         brightness = float(rng.uniform(0.35, 0.85))
-        mask = brightness * fall * np.exp(-0.5 * dist2 / (sigma_w * sigma_w))
-        _additive_mask_to_rgb(image, mask.astype(np.float32), (1.0, 1.0, 1.0))
+        sigma_w = max(0.9, diag / 1500.0 + 0.7)
+        _paint_streak(
+            image, p0, p1, sigma_w,
+            lambda t, b=brightness: b * ((1.0 - t) ** 1.6),
+        )
 
 
 def add_satellite_trails(
@@ -168,20 +204,9 @@ def add_satellite_trails(
     sigma = max(0.3, float(width_px))
     for _ in range(count):
         p0, p1 = _random_edge_points(rng, w, h)
-        seg_x = p1[0] - p0[0]
-        seg_y = p1[1] - p0[1]
-        if math.hypot(seg_x, seg_y) < 0.35 * diag:
+        if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) < 0.35 * diag:
             continue
-        gx, gy = np.meshgrid(np.arange(w), np.arange(h))
-        dx = gx - p0[0]
-        dy = gy - p0[1]
-        denom = seg_x * seg_x + seg_y * seg_y
-        t = np.clip((dx * seg_x + dy * seg_y) / denom, 0.0, 1.0)
-        px = dx - t * seg_x
-        py = dy - t * seg_y
-        dist2 = px * px + py * py
-        mask = brightness * np.exp(-0.5 * dist2 / (sigma * sigma))
-        _additive_mask_to_rgb(image, mask.astype(np.float32), (0.95, 0.97, 1.0))
+        _paint_streak(image, p0, p1, sigma, lambda t: np.full(t.shape, brightness), color=(0.95, 0.97, 1.0))
 
 
 def _random_edge_points(rng: np.random.RandomState, w: int, h: int) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -319,7 +344,7 @@ def add_gaussian_blob(
     h, w = image.shape[:2]
     if amplitude <= 0.0:
         return
-    pad = max(2, int(math.ceil(4.0 * sigma)))
+    pad = max(2, int(math.ceil(3.0 * sigma)) + 2)
     x0 = int(max(0, cx - pad))
     x1 = int(min(w, cx + pad))
     y0 = int(max(0, cy - pad))
@@ -327,8 +352,10 @@ def add_gaussian_blob(
     if x1 <= x0 or y1 <= y0:
         return
     gy, gx = np.mgrid[y0:y1, x0:x1]
+    gy = gy.astype(np.float32)
+    gx = gx.astype(np.float32)
     r2 = ((gx - cx) ** 2 + (gy - cy) ** 2) / (2.0 * sigma * sigma)
-    blob = (amplitude * np.exp(-r2)).astype(np.float32)
+    blob = (amplitude * np.exp(r2.astype(np.float32) * -1.0)).astype(np.float32)
     _additive_mask_to_rgb(image[y0:y1, x0:x1], blob, (0.9, 0.95, 1.0))
 
 
