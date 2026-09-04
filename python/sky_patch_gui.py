@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -412,7 +413,7 @@ class ImageCanvas(QWidget):
         self._panning = False
         self._last_hover_sky = None
         self.setMouseTracking(True)
-        self.setMinimumSize(480, 360)
+        self.setMinimumSize(320, 220)
 
     # -- external -----------------------------------------------------------
     def set_image(self, qimage: QImage, geometry: dict) -> None:
@@ -434,6 +435,10 @@ class ImageCanvas(QWidget):
         if self._image is None:
             return None
         return self._image.width(), self._image.height()
+
+    def clear_image(self) -> None:
+        self._image = None
+        self.update()
 
     def get_image(self) -> QImage | None:
         return self._image
@@ -603,6 +608,7 @@ class SkyPatchGui(QMainWindow):
         self._need_render = False
         self._frame = 0  # exposure counter for per-frame random artifacts
         self._current_image: QImage | None = None
+        self._error_image: QImage | None = None
         self._art_check: dict = {}
         self._art_param_ids: dict = {}
 
@@ -758,8 +764,31 @@ class SkyPatchGui(QMainWindow):
         right = QWidget(central)
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 8, 8, 8)
-        self.canvas = ImageCanvas(right)
-        rv.addWidget(self.canvas)
+
+        split = QSplitter(Qt.Orientation.Vertical, right)
+
+        self.frame_nominal = QGroupBox("Frame \u00b7 commanded pointing", right)
+        fn = QVBoxLayout(self.frame_nominal)
+        fn.setContentsMargins(4, 4, 4, 4)
+        self.lbl_nominal = QLabel(self.frame_nominal)
+        self.lbl_nominal.setStyleSheet("color: #9fb4d8;")
+        fn.addWidget(self.lbl_nominal)
+        self.canvas = ImageCanvas(self.frame_nominal)
+        fn.addWidget(self.canvas)
+        split.addWidget(self.frame_nominal)
+
+        self.frame_error = QGroupBox("Frame \u00b7 pointing error (extra)", right)
+        fe = QVBoxLayout(self.frame_error)
+        fe.setContentsMargins(4, 4, 4, 4)
+        self.lbl_error = QLabel(self.frame_error)
+        self.lbl_error.setStyleSheet("color: #d8b89f;")
+        fe.addWidget(self.lbl_error)
+        self.canvas_error = ImageCanvas(self.frame_error)
+        fe.addWidget(self.canvas_error)
+        split.addWidget(self.frame_error)
+        self.frame_error.setVisible(True)
+
+        rv.addWidget(split, 1)
         root.addWidget(right, 1)
 
         # Status bar
@@ -804,6 +833,11 @@ class SkyPatchGui(QMainWindow):
             self._art_param_ids[key] = row_params
             row += 1
 
+        effect(
+            "pointing",
+            "Extra pointing-error frame",
+            [("\u2264 % fov", _make_ispin(group, 0, 10, 1, 10))],
+        )
         effect(
             "noise",
             "Noise (bias + random)",
@@ -880,6 +914,8 @@ class SkyPatchGui(QMainWindow):
             return int(spin.value())
 
         art = {
+            "pointing": is_on("pointing"),
+            "pointing_offset": ival(param_widgets("pointing")[0]) / 100.0,
             "noise": is_on("noise"),
             "noise_sigma": fval(param_widgets("noise")[0]),
             "noise_bias": fval(param_widgets("noise")[1]),
@@ -915,6 +951,8 @@ class SkyPatchGui(QMainWindow):
 
     def _on_artifact_toggled(self, *_args) -> None:
         self._refresh_art_widget_enabled()
+        pointing = self._art_check["pointing"].isChecked()
+        self.frame_error.setVisible(pointing)
         self._schedule_render()
 
     def _on_artifact_changed(self, *_args) -> None:
@@ -945,6 +983,8 @@ class SkyPatchGui(QMainWindow):
         self.map_widget.hoverMoved.connect(self._on_pointer_hover)
         self.canvas.recentered.connect(self._on_map_center)
         self.canvas.hoverMoved.connect(self._on_pointer_hover)
+        self.canvas_error.recentered.connect(self._on_map_center)
+        self.canvas_error.hoverMoved.connect(self._on_pointer_hover)
 
         for spin in (
             self.spin_ra,
@@ -1025,6 +1065,35 @@ class SkyPatchGui(QMainWindow):
             "gain": self.spin_gain.value(),
         }
 
+    def _resolve_pointing(self, snap: dict) -> dict:
+        """Apply the pointing-error simulation -> the actual rendered RA/Dec/roll.
+
+        When enabled, the output image centre is nudged by up to
+        ``pointing_offset * fov`` degrees in a random direction and the camera
+        roll is re-randomised, each exposure (tracking / field-rotation error).
+        """
+        ra, dec, fov = snap["ra"], snap["dec"], snap["fov"]
+        art = snap.get("art") or {}
+        if not art.get("pointing", False):
+            return {
+                "ra": ra,
+                "dec": dec,
+                "fov": fov,
+                "roll": snap["roll"],
+            }
+        frame = int(art.get("frame", 0))
+        seed = int(art.get("seed", 0))
+        rng = np.random.RandomState((seed * 37 + frame * 131071) & 0xFFFFFFFF)
+        max_angle = math.radians(fov * float(art.get("pointing_offset", 0.1)))
+        if max_angle > 0.0:
+            phi = rng.uniform(0.0, 2.0 * math.pi)
+            rho = math.tan(max_angle) * math.sqrt(rng.uniform(0.0, 1.0))
+            ra, dec = gnomonic_inverse_pt(
+                rho * math.cos(phi), rho * math.sin(phi), ra, dec
+            )
+        roll = float(rng.uniform(0.0, 360.0))
+        return {"ra": float(ra), "dec": float(dec), "fov": float(fov), "roll": roll}
+
     # -- rendering control --------------------------------------------------
     def _force_render(self) -> None:
         self._debounce.stop()
@@ -1044,9 +1113,11 @@ class SkyPatchGui(QMainWindow):
             self._need_render = True  # newest request will win when we are free
             return
         snap = self._params_snapshot()
-        self._frame += 1  # each produced image is a fresh "exposure"
+        # reserve one exposure id per output frame (nominal + optional error)
+        n_frames = 2 if self._art_check["pointing"].isChecked() else 1
+        self._frame += n_frames
         art = self._artifact_settings()
-        art["frame"] = self._frame
+        art["frame"] = self._frame - n_frames + 1
         snap["art"] = art
         w, h = snap["width"], snap["height"]
         self._s_render.setText(f"rendering {w}\u00d7{h} \u2026")
@@ -1057,23 +1128,55 @@ class SkyPatchGui(QMainWindow):
         )
         thread.start()
 
+    def _render_frame(self, snap: dict) -> tuple[QImage, int]:
+        rgb, stars = self._compute_image(snap)
+        rgb = sky_effects.apply_effects(rgb, stars, snap.get("art") or {})
+        return rgb_to_qimage(rgb), stars["count"]
+
     def _render_worker(self, snap: dict, token: int) -> None:
         try:
+            art = snap.get("art") or {}
+            pointing = bool(art.get("pointing", False))
+            nominal_frame = int(art.get("frame", 0))
+
             t0 = time.perf_counter()
-            rgb, stars = self._compute_image(snap)
-            rgb = sky_effects.apply_effects(rgb, stars, snap.get("art") or {})
+            qnominal, stars_n = self._render_frame(snap)
+
+            error_image = None
+            error_geo = None
+            stars_e = 0
+            if pointing:
+                snap_err = dict(snap)
+                art_err = dict(art)
+                art_err["frame"] = nominal_frame + 1
+                snap_err["art"] = art_err
+                error_geo = self._resolve_pointing(snap_err)
+                snap_err.update(error_geo)
+                error_image, stars_e = self._render_frame(snap_err)
             dt = time.perf_counter() - t0
-            qimage = rgb_to_qimage(rgb)
+
+            qimage = qnominal
         except Exception as exc:  # noqa: BLE001 - report back to GUI thread
             self._bridge.done.emit({"ok": False, "token": token, "error": str(exc)})
             return
+        nominal_geo = {
+            "ra": snap["ra"],
+            "dec": snap["dec"],
+            "fov": snap["fov"],
+            "roll": snap["roll"],
+        }
         self._bridge.done.emit(
             {
                 "ok": True,
                 "token": token,
                 "image": qimage,
-                "stars": stars["count"],
+                "stars": stars_n,
+                "stars_error": stars_e,
                 "dt": dt,
+                "geo": nominal_geo,
+                "error_image": error_image,
+                "error_geo": error_geo,
+                "pointing_on": pointing,
             }
         )
 
@@ -1138,12 +1241,33 @@ class SkyPatchGui(QMainWindow):
         if payload.get("ok") and not stale:
             image = payload["image"]
             self._current_image = image
-            self.canvas.set_image(image, self._params_snapshot())
+            self.canvas.set_image(image, payload.get("geo") or self._params_snapshot())
             self._s_render.setText(
-                f"{image.width()}\u00d7{image.height()}  \u00b7  {payload['stars']} stars  "
-                f"\u00b7  {payload['dt'] * 1000:.0f} ms"
+                f"{image.width()}\u00d7{image.height()}  \u00b7  "
+                f"{payload['stars']} stars  \u00b7  {payload['dt'] * 1000:.0f} ms"
             )
             self.status.showMessage("Ready", 3000)
+
+            geo_n = payload.get("geo") or {}
+            self.lbl_nominal.setText(
+                f"commanded center  {ra_to_hms(geo_n.get('ra', 0.0))}  "
+                f"{dec_to_dms(geo_n.get('dec', 0.0))}  \u00b7  roll {geo_n.get('roll', 0.0):.1f}\u00b0"
+            )
+
+            error_image = payload.get("error_image")
+            error_geo = payload.get("error_geo")
+            self._error_image = error_image
+            show_error = bool(payload.get("pointing_on")) and error_image is not None
+            self.frame_error.setVisible(show_error)
+            if show_error and error_geo is not None:
+                self.canvas_error.set_image(error_image, error_geo)
+                self.lbl_error.setText(
+                    f"actual center  {ra_to_hms(error_geo['ra'])}  "
+                    f"{dec_to_dms(error_geo['dec'])}  \u00b7  roll {error_geo['roll']:.1f}\u00b0  "
+                    f"\u00b7  {payload.get('stars_error', 0)} stars"
+                )
+            else:
+                self.canvas_error.clear_image()
         elif not payload.get("ok") and not stale:
             self.status.showMessage(f"Render error: {payload.get('error', '?')}", 8000)
             self._s_render.setText("render failed")
@@ -1168,10 +1292,21 @@ class SkyPatchGui(QMainWindow):
         if not path:
             return
         ok = self._current_image.save(path)
-        if ok:
-            self.status.showMessage(f"Saved {path}", 5000)
-        else:
+        if not ok:
             QMessageBox.warning(self, "Save image", f"Failed to write:\n{path}")
+            return
+        saved = [path]
+        if self._error_image is not None:
+            p = Path(path)
+            err_path = str(p.with_name(f"{p.stem}_err{p.suffix}"))
+            if self._error_image.save(err_path):
+                saved.append(err_path)
+        if len(saved) > 1:
+            self.status.showMessage(
+                f"Saved nominal + pointing-error frames:\n{saved[0]}\n{saved[1]}", 6000
+            )
+        else:
+            self.status.showMessage(f"Saved {saved[0]}", 5000)
 
 
 def rgb_to_qimage(rgb: np.ndarray) -> QImage:
