@@ -66,17 +66,6 @@ DEFAULT_FOV = 30.0
 
 OVERVIEW_MAG = 6.5  # stars shown on the all-sky map
 
-# Effect name -> parameter controls that should grey out when the effect is off.
-ART_PARAM_MAP = {
-    "noise": ("noise_sigma", "noise_bias"),
-    "cr": ("cr_count",),
-    "meteor": ("meteor_count",),
-    "dust": ("dust_count", "dust_size"),
-    "seeing": ("seeing_sigma",),
-    "spike": ("spike_len", "spike_int"),
-    "ghost": ("ghost_int",),
-}
-
 
 def _make_ispin(parent, lo: int, hi: int, step: int, val: int) -> QSpinBox:
     s = QSpinBox(parent)
@@ -801,6 +790,7 @@ class SkyPatchGui(QMainWindow):
         def effect(key: str, title: str, controls) -> None:
             nonlocal row
             check = QCheckBox(title, group)
+            check.setChecked(True)  # all simulations on by default
             self._art_check[key] = check
             grid.addWidget(check, row, 0)
             row_params = []
@@ -833,6 +823,15 @@ class SkyPatchGui(QMainWindow):
             [("count", _make_ispin(group, 0, 5, 1, 1))],
         )
         effect(
+            "satellite",
+            "Satellite trail",
+            [
+                ("count", _make_ispin(group, 0, 5, 1, 1)),
+                ("width", _make_fspin(group, 0.3, 4.0, 1, 0.1, 0.9)),
+                ("int", _make_fspin(group, 0.0, 1.2, 2, 0.05, 0.3)),
+            ],
+        )
+        effect(
             "dust",
             "CMOS dust specks",
             [
@@ -849,8 +848,8 @@ class SkyPatchGui(QMainWindow):
             "spike",
             "Diffraction spikes",
             [
-                ("len%", _make_fspin(group, 0.0, 45.0, 0, 1.0, 12.0)),
-                ("int", _make_fspin(group, 0.0, 3.0, 1, 0.1, 1.0)),
+                ("len%", _make_fspin(group, 0.0, 45.0, 0, 1.0, 3.0)),
+                ("int", _make_fspin(group, 0.0, 3.0, 1, 0.1, 0.8)),
             ],
         )
         effect(
@@ -888,6 +887,10 @@ class SkyPatchGui(QMainWindow):
             "cr_count": ival(param_widgets("cr")[0]),
             "meteor": is_on("meteor"),
             "meteor_count": ival(param_widgets("meteor")[0]),
+            "satellite": is_on("satellite"),
+            "sat_count": ival(param_widgets("satellite")[0]),
+            "sat_width": fval(param_widgets("satellite")[1]),
+            "sat_brightness": fval(param_widgets("satellite")[2]),
             "dust": is_on("dust"),
             "dust_count": ival(param_widgets("dust")[0]),
             "dust_size": fval(param_widgets("dust")[1]) / 100.0,

@@ -12,6 +12,7 @@ Effects:
     seeing         - atmospheric turbulence (extra Gaussian blur)
     spikes         - diffraction spikes on the brightest stars
     ghost          - faint offset "ghost" reflections of bright stars
+    satellite      - even-width bright satellite transit streaks
 """
 
 from __future__ import annotations
@@ -146,6 +147,41 @@ def add_meteor_trail(image: np.ndarray, count: int, seed: int, frame: int) -> No
         brightness = float(rng.uniform(0.35, 0.85))
         mask = brightness * fall * np.exp(-0.5 * dist2 / (sigma_w * sigma_w))
         _additive_mask_to_rgb(image, mask.astype(np.float32), (1.0, 1.0, 1.0))
+
+
+def add_satellite_trails(
+    image: np.ndarray,
+    count: int,
+    width_px: float,
+    brightness: float,
+    seed: int,
+    frame: int,
+) -> None:
+    """Even-width, near-constant-brightness streaks (satellite passes).
+
+    Unlike meteors, a satellite travels with roughly constant angular speed,
+    so its trail is a straight, uniformly bright chord across the field.
+    """
+    rng = _transient_rng(seed * 13 + 8, frame)
+    h, w = image.shape[:2]
+    diag = math.hypot(w, h)
+    sigma = max(0.3, float(width_px))
+    for _ in range(count):
+        p0, p1 = _random_edge_points(rng, w, h)
+        seg_x = p1[0] - p0[0]
+        seg_y = p1[1] - p0[1]
+        if math.hypot(seg_x, seg_y) < 0.35 * diag:
+            continue
+        gx, gy = np.meshgrid(np.arange(w), np.arange(h))
+        dx = gx - p0[0]
+        dy = gy - p0[1]
+        denom = seg_x * seg_x + seg_y * seg_y
+        t = np.clip((dx * seg_x + dy * seg_y) / denom, 0.0, 1.0)
+        px = dx - t * seg_x
+        py = dy - t * seg_y
+        dist2 = px * px + py * py
+        mask = brightness * np.exp(-0.5 * dist2 / (sigma * sigma))
+        _additive_mask_to_rgb(image, mask.astype(np.float32), (0.95, 0.97, 1.0))
 
 
 def _random_edge_points(rng: np.random.RandomState, w: int, h: int) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -328,6 +364,15 @@ def apply_effects(
         )
     if art.get("ghost", False):
         add_ghost_reflections(out, stars, float(art.get("ghost_int", 0.5)), seed)
+    if art.get("satellite", False):
+        add_satellite_trails(
+            out,
+            int(art.get("sat_count", 1)),
+            float(art.get("sat_width", 0.9)),
+            float(art.get("sat_brightness", 0.3)),
+            seed,
+            frame,
+        )
 
     seeing_sigma = float(art.get("seeing_sigma", 0.0))
     if art.get("seeing", False) and seeing_sigma > 0.0:
