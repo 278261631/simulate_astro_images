@@ -116,6 +116,33 @@ def gnomonic_inverse_pt(x: float, y: float, ra0_deg: float, dec0_deg: float) -> 
     return ra, dec
 
 
+def gnomonic_inverse_vec(
+    x: np.ndarray, y: np.ndarray, ra0_deg: float, dec0_deg: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised gnomonic inverse (used for frame registration)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    ra0 = math.radians(ra0_deg)
+    dec0 = math.radians(dec0_deg)
+    srx, crx = math.sin(ra0), math.cos(ra0)
+    sdc, cdc = math.sin(dec0), math.cos(dec0)
+
+    cx, cy, cz = cdc * crx, cdc * srx, sdc
+    ex, ey = -srx, crx
+    nx, ny, nz = -sdc * crx, -sdc * srx, cdc
+
+    vx = cx + x * ex + y * nx
+    vy = cy + x * ey + y * ny
+    vz = cz + x * 0.0 + y * nz
+    norm = np.sqrt(vx * vx + vy * vy + vz * vz)
+    vx /= norm
+    vy /= norm
+    vz /= norm
+    ra = np.degrees(np.arctan2(vy, vx)) % 360.0
+    dec = np.degrees(np.arcsin(np.clip(vz, -1.0, 1.0)))
+    return ra, dec
+
+
 def ra_to_hms(ra_deg: float) -> str:
     ra = ra_deg % 360.0
     hours = ra / 15.0
@@ -609,6 +636,9 @@ class SkyPatchGui(QMainWindow):
         self._frame = 0  # exposure counter for per-frame random artifacts
         self._current_image: QImage | None = None
         self._error_image: QImage | None = None
+        self._b_rgb: np.ndarray | None = None  # raw B frame as float RGB
+        self._b_geo_n: dict | None = None  # A (commanded) geometry
+        self._b_geo_b: dict | None = None  # B (pointing-error) geometry
         self._art_check: dict = {}
         self._art_param_ids: dict = {}
 
@@ -767,7 +797,7 @@ class SkyPatchGui(QMainWindow):
 
         split = QSplitter(Qt.Orientation.Vertical, right)
 
-        self.frame_nominal = QGroupBox("Frame \u00b7 commanded pointing", right)
+        self.frame_nominal = QGroupBox("A \u00b7 original frame (commanded pointing)", right)
         fn = QVBoxLayout(self.frame_nominal)
         fn.setContentsMargins(4, 4, 4, 4)
         self.lbl_nominal = QLabel(self.frame_nominal)
@@ -777,12 +807,20 @@ class SkyPatchGui(QMainWindow):
         fn.addWidget(self.canvas)
         split.addWidget(self.frame_nominal)
 
-        self.frame_error = QGroupBox("Frame \u00b7 pointing error (extra)", right)
+        self.frame_error = QGroupBox("B \u00b7 extra frame (pointing error)", right)
         fe = QVBoxLayout(self.frame_error)
         fe.setContentsMargins(4, 4, 4, 4)
+        fe_top = QHBoxLayout()
+        fe_top.addStretch(1)
+        self.check_align = QCheckBox("Align B to A", self.frame_error)
+        fe_top.addWidget(self.check_align)
+        fe.addLayout(fe_top)
         self.lbl_error = QLabel(self.frame_error)
         self.lbl_error.setStyleSheet("color: #d8b89f;")
         fe.addWidget(self.lbl_error)
+        self.lbl_error_offset = QLabel(self.frame_error)
+        self.lbl_error_offset.setStyleSheet("color: #b9c4d8;")
+        fe.addWidget(self.lbl_error_offset)
         self.canvas_error = ImageCanvas(self.frame_error)
         fe.addWidget(self.canvas_error)
         split.addWidget(self.frame_error)
@@ -953,6 +991,7 @@ class SkyPatchGui(QMainWindow):
         self._refresh_art_widget_enabled()
         pointing = self._art_check["pointing"].isChecked()
         self.frame_error.setVisible(pointing)
+        self.check_align.setEnabled(pointing)
         self._schedule_render()
 
     def _on_artifact_changed(self, *_args) -> None:
@@ -1011,6 +1050,7 @@ class SkyPatchGui(QMainWindow):
         self.check_live.toggled.connect(self._on_live_toggled)
         self.btn_render.clicked.connect(self._force_render)
         self.btn_save.clicked.connect(self._save_image)
+        self.check_align.toggled.connect(self._on_align_toggled)
 
     def _on_live_toggled(self, checked: bool) -> None:
         if checked:
@@ -1093,6 +1133,71 @@ class SkyPatchGui(QMainWindow):
             )
         roll = float(rng.uniform(0.0, 360.0))
         return {"ra": float(ra), "dec": float(dec), "fov": float(fov), "roll": roll}
+
+    def _pixel_offset(self, geo_a: dict, geo_b: dict, w: int, h: int) -> tuple[int, int, float]:
+        """Where A's centre appears inside B's frame, as a signed pixel offset.
+
+        Returns (dx, dy, droll) in B's image coordinates (right/down positive,
+        rounded to whole pixels): ``dx/dy`` = pixel position of A's centre
+        minus B's image centre; ``droll`` (deg) = B roll - A roll.
+        """
+        half = math.tan(math.radians(float(geo_a["fov"]) / 2.0))
+        x, y, _ = gnomonic_project(
+            np.asarray([geo_a["ra"]]), np.asarray([geo_a["dec"]]),
+            geo_b["ra"], geo_b["dec"],
+        )
+        xr, yr = apply_roll(x, y, geo_b["roll"])
+        xp = float(((xr + half) / (2.0 * half) * (w - 1))[0])
+        yp = float(((half - yr) / (2.0 * half) * (h - 1))[0])
+        dx = int(round(xp - (w - 1) / 2.0))
+        dy = int(round(yp - (h - 1) / 2.0))
+        droll = (float(geo_b["roll"]) - float(geo_a["roll"]) + 180.0) % 360.0 - 180.0
+        return dx, dy, droll
+
+    def _align_b_to_a(self, rgb_b: np.ndarray, geo_a: dict, geo_b: dict) -> np.ndarray:
+        """Resample frame B onto A's grid (translate + de-rotate) -> aligned B.
+
+        Every output pixel (A's commanded pointing grid) is mapped to the sky
+        through A's geometry and then back-projected into B, sampling B with
+        bilinear interpolation. Result matches A in centre and orientation.
+        """
+        h, w = rgb_b.shape[:2]
+        half = math.tan(math.radians(float(geo_a["fov"]) / 2.0))
+
+        col = np.arange(w, dtype=np.float64)
+        row = np.arange(h, dtype=np.float64)
+        pxv, pyv = np.meshgrid(col, row)
+
+        # pixel -> A's tangent-plane coords (undo A roll -> east/north frame)
+        x = (pxv / max(1, w - 1)) * 2.0 * half - half
+        y = half - (pyv / max(1, h - 1)) * 2.0 * half
+        xu, yu = apply_roll(x, y, -geo_a["roll"])
+        ra, dec = gnomonic_inverse_vec(xu, yu, geo_a["ra"], geo_a["dec"])
+
+        # sky -> B frame pixel
+        xb, yb, _ = gnomonic_project(ra, dec, geo_b["ra"], geo_b["dec"])
+        xb, yb = apply_roll(xb, yb, geo_b["roll"])
+        px_b = (xb + half) / (2.0 * half) * (w - 1)
+        py_b = (half - yb) / (2.0 * half) * (h - 1)
+
+        # bilinear sample
+        x0 = np.floor(px_b).astype(np.int64)
+        y0 = np.floor(py_b).astype(np.int64)
+        wx = px_b - x0
+        wy = py_b - y0
+        ok = (x0 >= 0) & (x0 + 1 < w) & (y0 >= 0) & (y0 + 1 < h)
+        out = np.zeros_like(rgb_b)
+        if ok.any():
+            iy = y0[ok]
+            ix = x0[ok]
+            wxl = wx[ok, None]
+            wyl = wy[ok, None]
+            c00 = rgb_b[iy, ix] * ((1.0 - wxl) * (1.0 - wyl))
+            c01 = rgb_b[iy, np.clip(ix + 1, 0, w - 1)] * (wxl * (1.0 - wyl))
+            c10 = rgb_b[np.clip(iy + 1, 0, h - 1), ix] * ((1.0 - wxl) * wyl)
+            c11 = rgb_b[np.clip(iy + 1, 0, h - 1), np.clip(ix + 1, 0, w - 1)] * (wxl * wyl)
+            out[ok] = c00 + c01 + c10 + c11
+        return np.clip(out, 0.0, 1.0)
 
     # -- rendering control --------------------------------------------------
     def _force_render(self) -> None:
@@ -1260,19 +1365,58 @@ class SkyPatchGui(QMainWindow):
             show_error = bool(payload.get("pointing_on")) and error_image is not None
             self.frame_error.setVisible(show_error)
             if show_error and error_geo is not None:
-                self.canvas_error.set_image(error_image, error_geo)
-                self.lbl_error.setText(
-                    f"actual center  {ra_to_hms(error_geo['ra'])}  "
-                    f"{dec_to_dms(error_geo['dec'])}  \u00b7  roll {error_geo['roll']:.1f}\u00b0  "
-                    f"\u00b7  {payload.get('stars_error', 0)} stars"
-                )
+                # Keep raw B (QImage + float RGB) so "Align B to A" can be
+                # applied instantly later without re-rendering.
+                self._b_geo_n = dict(payload.get("geo") or {})
+                self._b_geo_b = dict(error_geo)
+                self._b_rgb = qimage_to_float_rgb(error_image)
+                self._refresh_b_display()
             else:
+                self._b_rgb = None
+                self._b_geo_n = None
+                self._b_geo_b = None
+                self.lbl_error_offset.setText("")
+                self.lbl_error.setText("")
                 self.canvas_error.clear_image()
         elif not payload.get("ok") and not stale:
             self.status.showMessage(f"Render error: {payload.get('error', '?')}", 8000)
             self._s_render.setText("render failed")
         if self._need_render and not self._busy:
             self._launch_render()
+
+    def _on_align_toggled(self, *_args) -> None:
+        # Registration only re-uses the current B frame - no re-render.
+        self._refresh_b_display()
+
+    def _refresh_b_display(self) -> None:
+        if self._b_rgb is None or not self._b_geo_n or not self._b_geo_b:
+            return
+        geo_n, geo_b = self._b_geo_n, self._b_geo_b
+        h, w = self._b_rgb.shape[:2]
+        dx, dy, droll = self._pixel_offset(geo_n, geo_b, w, h)
+        if self.check_align.isChecked():
+            aligned = self._align_b_to_a(self._b_rgb, geo_n, geo_b)
+            self.canvas_error.set_image(rgb_to_qimage(aligned), geo_n)
+            self.lbl_error.setText(
+                f"B \u2192 A aligned (on A grid)  \u00b7  shift ({-dx:+d},{-dy:+d}) px, "
+                f"rotation {-droll:+.1f}\u00b0"
+            )
+            self.lbl_error_offset.setText(
+                f"residual after registration \u2248 0 px / 0\u00b0  \u00b7  "
+                f"original offset: \u0394x {dx:+d} px,  \u0394y {dy:+d} px,  "
+                f"\u0394roll {droll:+.1f}\u00b0"
+            )
+        else:
+            self.canvas_error.set_image(self._error_image, geo_b)
+            self.lbl_error.setText(
+                f"actual center  {ra_to_hms(geo_b['ra'])}  {dec_to_dms(geo_b['dec'])}  "
+                f"\u00b7  roll {geo_b['roll']:.1f}\u00b0"
+            )
+            self.lbl_error_offset.setText(
+                f"A centre in B frame:  \u0394x {dx:+d} px,  \u0394y {dy:+d} px   \u00b7   "
+                f"\u0394roll {droll:+.1f}\u00b0"
+                f"   (shift B by {-dx:+d}, {-dy:+d} px to align A/B)"
+            )
 
     # -- save ---------------------------------------------------------------
     def _save_image(self) -> None:
@@ -1320,6 +1464,18 @@ def rgb_to_qimage(rgb: np.ndarray) -> QImage:
     arr[..., 3] = 255
     qi = QImage(arr.data, w, h, w * 4, QImage.Format.Format_RGB32)
     return qi.copy()
+
+
+def qimage_to_float_rgb(qi: QImage) -> np.ndarray:
+    """RGB32 QImage -> float RGB (H, W, 3) in [0, 1]."""
+    img = qi.convertToFormat(QImage.Format.Format_RGB32)
+    h, w = img.height(), img.width()
+    bgra = np.frombuffer(bytes(img.constBits()), dtype=np.uint8).reshape((h, w, 4))
+    out = np.empty((h, w, 3), dtype=np.float32)
+    out[..., 0] = bgra[..., 2] / 255.0  # R
+    out[..., 1] = bgra[..., 1] / 255.0  # G
+    out[..., 2] = bgra[..., 0] / 255.0  # B
+    return out
 
 
 def apply_dark_theme(app: QtWidgets.QApplication) -> None:
