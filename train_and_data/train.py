@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Train PairRegNet on the generated (A, B) -> (dx, dy, droll) dataset.
 
+The train split is read *streaming* (memmap + per-batch fetch), so dataset
+sizes of hundreds of thousands of pairs fit in RAM; per-frame normalisation
+constants are computed once and cached as ``<data>/train_norm_<n>.npz``.
+
 Usage:
     python train.py --data data --epochs 15 --batch 32
 
@@ -34,8 +38,18 @@ def set_seed(seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset loading (streaming for the big train split)
 # ---------------------------------------------------------------------------
+#
+# A 500k-pair train set is ~35 GB of uint8 frames: it must never be fully
+# materialised in RAM. Frames are opened as *memmaps* (only pages that are
+# actually read consume RAM) and each training batch gathers + percentile-
+# stretches just its own indices on the fly. The per-frame (lo, span)
+# normalisation constants are tiny ((N,) float32 each) and are computed once,
+# then cached to ``<data>/<split>_norm_<n>.npz`` so the expensive pass over
+# the frames only happens on the first run.
+#
+# val/test are small and keep the original load-everything path.
 
 
 def load_split(data_dir: Path, split: str):
@@ -45,11 +59,77 @@ def load_split(data_dir: Path, split: str):
     return a, b, lab
 
 
+def open_split_mmap(data_dir: Path, split: str):
+    """Open ``split``'s frames as memmaps + load its (small) labels fully."""
+    a = np.load(data_dir / f"{split}_a.npy", mmap_mode="r")
+    b = np.load(data_dir / f"{split}_b.npy", mmap_mode="r")
+    lab = np.load(data_dir / f"{split}_labels.npy")
+    return a, b, lab
+
+
 def to_pair_tensor(a_u8: np.ndarray, b_u8: np.ndarray) -> torch.Tensor:
-    """Stack all preprocessed pairs -> (N, 2, H, W) float32."""
+    """Stack all preprocessed pairs -> (N, 2, H, W) float32.
+
+    Only used for small splits (val/test); for big splits see the memmap path.
+    """
     n = a_u8.shape[0]
     pre = [preprocess(a_u8[i], b_u8[i]) for i in range(n)]
     return torch.stack(pre)
+
+
+def frame_stretch_constants(imgs, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame (1.0, 99.5) percentile -> (lo, span) (n,) float32 each.
+
+    Mirrors ``model.preprocess`` exactly: a frame whose hi - lo <= 1e-6 is not
+    rescaled (kept raw), which is encoded as lo=0, span=1.
+    """
+    lo = np.zeros(n, dtype=np.float32)
+    span = np.ones(n, dtype=np.float32)
+    t0 = time.perf_counter()
+    for i in range(n):
+        vlo, vhi = np.percentile(imgs[i], (1.0, 99.5))
+        d = float(vhi - vlo)
+        if d > 1e-6:
+            lo[i] = float(vlo)
+            span[i] = d
+        if (i + 1) % 50_000 == 0 or i == n - 1:
+            el = time.perf_counter() - t0
+            print(f"    norm {i + 1}/{n}   {el:6.0f}s elapsed  "
+                  f"{(el / (i + 1)) * 1e3:4.1f} ms/frame", flush=True)
+    return lo, span
+
+
+def split_norm(data_dir: Path, split: str, a, b, n: int):
+    """(lo_a, span_a, lo_b, span_b) for ``split``; cached to disk per (split, n)."""
+    cache = data_dir / f"{split}_norm_{n}.npz"
+    if cache.exists():
+        z = np.load(cache)
+        if len(z["lo_a"]) == n:
+            # np.savez arrays may stay lazily mmapped; materialise the copies.
+            return tuple(np.array(z[k], copy=True) for k in
+                         ("lo_a", "span_a", "lo_b", "span_b"))
+    print(f"  computing per-frame stretch constants for {split} ({n} pairs) ...",
+          flush=True)
+    lo_a, span_a = frame_stretch_constants(a, n)
+    lo_b, span_b = frame_stretch_constants(b, n)
+    np.savez(cache, lo_a=lo_a, span_a=span_a, lo_b=lo_b, span_b=span_b)
+    print(f"  cached norm constants to {cache.name}")
+    return lo_a, span_a, lo_b, span_b
+
+
+def fetch_norm_batch(a, b, norm, idx) -> np.ndarray:
+    """Gather frames at ``idx`` (int array), percentile-stretch, stack.
+
+    Returns a fresh writable float32 array of shape (B, 2, H, W) matching
+    ``to_pair_tensor`` semantics: channel 0 = A, channel 1 = B.
+    """
+    la, sa, lb, sb = norm
+    ia = np.asarray(idx, dtype=np.int64)
+    la, sa = la[ia][:, None, None], sa[ia][:, None, None]
+    lb, sb = lb[ia][:, None, None], sb[ia][:, None, None]
+    xa = np.clip((a[ia].astype(np.float32) - la) / sa, 0.0, 1.0)
+    xb = np.clip((b[ia].astype(np.float32) - lb) / sb, 0.0, 1.0)
+    return np.stack((xa, xb), axis=1)
 
 
 def horizontal_flip(pair: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -79,16 +159,20 @@ def rotate_180(pair: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch
 _AUGS = (horizontal_flip, vertical_flip, rotate_180)
 
 
-def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop_min: int | None = None,
+def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
                  p_crop: float = 0.0):
+    """Augment one (2, H, W) pair (+ its (4,) encoded target) on the CPU.
+
+    ``crop``: fixed-size random-location crop applied identically to both
+    frames (a pure translation, so dx/dy/droll are unchanged). Mirrors and
+    180 rotations flip the dx/dy/roll signs accordingly; photometric jitter
+    and light noise are per channel/frame.
+    """
     h, w = pair.shape[1:]
-    # identical random crop on both frames; offsets are unchanged by it
-    if crop_min is not None and p_crop > 0.0 and h > crop_min:
-        if np.random.rand() < p_crop:
-            cs = int(np.random.randint(crop_min, h))
-            y0 = int(np.random.randint(0, h - cs + 1))
-            x0 = int(np.random.randint(0, w - cs + 1))
-            pair = pair[:, y0 : y0 + cs, x0 : x0 + cs]
+    if crop is not None and 0 < crop < h and np.random.rand() < p_crop:
+        y0 = int(np.random.randint(0, h - crop + 1))
+        x0 = int(np.random.randint(0, w - crop + 1))
+        pair = pair[:, y0 : y0 + crop, x0 : x0 + crop]
     # mirror / 180 rotations, adjusting dx, dy and roll accordingly
     if np.random.rand() < 0.5:
         aug = _AUGS[int(np.random.randint(0, len(_AUGS)))]
@@ -191,7 +275,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--crop", type=int, default=0,
-                   help="train on random crops of this size (0 = full frame)")
+                   help="train on fixed-size random crops of this size "
+                        "(0 = full frame)")
+    p.add_argument("--max-train", type=int, default=0,
+                   help="cap the number of train samples actually used "
+                        "(0 = all); handy to smoke-test on a huge dataset")
     return p.parse_args()
 
 
@@ -205,14 +293,21 @@ def main() -> None:
     print(f"device: {device}")
 
     t0 = time.perf_counter()
-    tr_a, tr_b, tr_y = load_split(args.data, "train")
+    # train split is streamed (memmap + per-batch fetch) so 100k+ samples fit
+    # in RAM; val/test are tiny and keep the load-everything path.
+    tr_a, tr_b, tr_y = open_split_mmap(args.data, "train")
     va_a, va_b, va_y = load_split(args.data, "val")
     te_a, te_b, te_y = load_split(args.data, "test")
     size = tr_a.shape[1]
-    print(f"load: train {len(tr_a)} val {len(va_a)} test {len(te_a)}  size {size}  "
+    n = int(tr_a.shape[0])
+    if 0 < args.max_train < n:
+        n = args.max_train
+        tr_a, tr_b = tr_a[:n], tr_b[:n]
+        tr_y = tr_y[:n]
+    print(f"load: train {n} val {len(va_a)} test {len(te_a)}  size {size}  "
           f"({time.perf_counter() - t0:.1f}s)")
 
-    train_pairs = to_pair_tensor(tr_a, tr_b)
+    tr_norm = split_norm(args.data, "train", tr_a, tr_b, n)
     train_ys = encode_target(tr_y)
     val_pairs = to_pair_tensor(va_a, va_b)
     val_ys = encode_target(va_y)
@@ -224,31 +319,29 @@ def main() -> None:
     zero = np.zeros_like(lab)
     print("baseline (predict dx=dy=roll=0):", fmt(metrics(zero, lab)))
 
-    crop = args.crop or size
+    crop = args.crop if 0 < args.crop < size else None
     model = PairRegNet().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    n = len(train_pairs)
     best = None
 
     for ep in range(args.epochs):
         model.train()
         t_ep = time.perf_counter()
-        order = torch.randperm(n)
+        order = np.random.permutation(n)
         tot_loss = 0.0
         nb = 0
         for i in range(0, n, args.batch):
             idx = order[i : i + args.batch]
-            pb = train_pairs[idx].clone()
-            yb = train_ys[idx].clone()
+            pb = torch.from_numpy(fetch_norm_batch(tr_a, tr_b, tr_norm, idx))
+            yb = train_ys[torch.from_numpy(np.asarray(idx, dtype=np.int64))].clone()
+            pairs, ys = [], []
             for j in range(len(pb)):
-                pb[j], yb[j] = augment_pair(
-                    pb[j], yb[j],
-                    crop_min=(crop if crop < size else None),
-                    p_crop=0.9 if crop < size else 0.0,
-                )
-            pb = pb.to(device)
-            yb = yb.to(device)
+                p, y = augment_pair(pb[j], yb[j], crop=crop, p_crop=1.0 if crop else 0.0)
+                pairs.append(p)
+                ys.append(y)
+            pb = torch.stack(pairs).to(device)
+            yb = torch.stack(ys).to(device)
             opt.zero_grad()
             out = model(pb)
             loss = regression_loss(out, yb)
