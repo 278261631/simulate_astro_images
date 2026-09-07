@@ -407,11 +407,16 @@ def apply_effects(
 
     # --- sensor-plane shadows ---
     if art.get("dust", False):
+        dust_seed = seed
+        if art.get("dust_per_frame", False):
+            # Independent speckle pattern per exposure (e.g. after flat-field
+            # calibration, or when A/B must not share a stationary confounder).
+            dust_seed = (int(seed) * 7919 + int(frame) * 104729) & 0xFFFFFFFF
         add_dust_specks(
             out,
             int(art.get("dust_count", 6)),
             float(art.get("dust_size", DEFAULT_DUST_SIZE)),
-            seed,
+            dust_seed,
         )
 
     # --- transient detector events ---
