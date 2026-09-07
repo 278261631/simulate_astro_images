@@ -10,8 +10,11 @@ cd /d "%~dp0"
 set "PY=python"
 set "SCRIPT=generate_dataset.py"
 
-echo Generating default dataset: 1500 train / 200 val / 200 test @ 192px
-%PY% "%SCRIPT%" --train 1500 --val 200 --test 200 %*
+REM Pick a random seed each run so the content is never the same twice.
+REM (seed is recorded in data\params.json; append --seed N to force a value)
+set /a "SEED=(%RANDOM%*1000)+%RANDOM%"
+echo Generating default dataset: 1500 train / 200 val / 200 test @ 192px  (seed %SEED%)
+%PY% "%SCRIPT%" --train 1500 --val 200 --test 200 --seed %SEED% %*
 
 echo.
 echo Done. Data is in:

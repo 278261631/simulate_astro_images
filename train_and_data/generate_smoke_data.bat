@@ -13,8 +13,11 @@ cd /d "%~dp0"
 set "PY=python"
 set "SCRIPT=generate_dataset.py"
 
-echo Generating smoke-test dataset (images + text): 16 train / 8 val / 8 test @ 96px
-%PY% "%SCRIPT%" --train 0 --val 0 --test 0 --smoke %*
+REM Pick a random seed each run so the smoke content is never the same twice.
+REM (append --seed N to force a value and make it reproducible)
+set /a "SEED=(%RANDOM%*1000)+%RANDOM%"
+echo Generating smoke-test dataset (images + text): 16 train / 8 val / 8 test @ 96px  (seed %SEED%)
+%PY% "%SCRIPT%" --train 0 --val 0 --test 0 --smoke --seed %SEED% %*
 
 echo.
 echo Done. Smoke-test data (PNG pairs + TXT labels) is in:
