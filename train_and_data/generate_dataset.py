@@ -30,6 +30,11 @@ Output (as raw numpy files so no image I/O library is required):
     <out>/<split>_labels.npy   (N, 3)   float64  [dx, dy, droll_deg]
     <out>/<split>_meta.npz     fov, roll_a, stars_a, stars_b arrays
     <out>/params.json          dataset hyper-parameters
+
+With ``--smoke`` an additional small independent smoke-test dataset is written
+to ``--smoke-out`` (default ``data_smoke/``) as *directly usable PNG images +
+text labels* (one A/B PNG pair and one TXT per sample, per split sub-folder;
+no numpy files), using a separate RNG stream so the main dataset is unaffected.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -393,6 +399,99 @@ def export_check_samples(
     return written
 
 
+def export_pair_images(split: str, gi: int, rec: dict, size: int, split_dir: Path) -> None:
+    """Write one pair as directly viewable PNGs (A/B) + a text label file.
+
+    Used by the image/text smoke dataset: no .npy, just files a human (or any
+    other tool) can consume:
+        <split_dir>/<gi:06d>_a.png   display-stretched frame A
+        <split_dir>/<gi:06d>_b.png   display-stretched frame B
+        <split_dir>/<gi:06d>.txt     geometry + star counts + the label
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        raise SystemExit(
+            "Pillow is required for the image/text smoke dataset:\n"
+            "  python -m pip install pillow"
+        )
+    stem = split_dir / f"{gi:06d}"
+    dx, dy, droll = rec["label"]
+    txt = (
+        f"split            {split}\n"
+        f"index            {gi}\n"
+        f"image size       {size} x {size}\n"
+        f"A center RA/Dec  {rec['ra0']:.4f} deg  {rec['dec0']:.4f} deg\n"
+        f"commanded roll A {rec['roll_a']:.2f} deg\n"
+        f"actual roll B    {rec['roll_b']:.2f} deg   (droll {rec['droll']:+.3f})\n"
+        f"FOV              {rec['fov']:.3f} deg\n"
+        f"pointing offset  up to {rec['offset_frac'] * 100.0:.1f}% of FOV\n"
+        f"stars in frame   A {rec['stars_a']}   B {rec['stars_b']}\n"
+        f"seed             {int(rec['seed'])}\n"
+        f"\n"
+        f"label  dx  {dx:+.3f} px\n"
+        f"       dy  {dy:+.3f} px\n"
+        f"       droll {droll:+.3f} deg\n"
+        f"(A's centre appears at B's centre + (dx, dy); shift B by "
+        f"({-dx:+.3f}, {-dy:+.3f}) px and rotate {-droll:+.3f} deg to align "
+        f"B onto A)\n"
+    )
+    stem.with_suffix(".txt").write_text(txt)
+
+    lo, hi = np.percentile(rec["img_a"], (0.5, 99.5))
+    x = (rec["img_a"].astype(np.float32) - lo) / max(1e-6, hi - lo)
+    Image.fromarray((np.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+        f"{stem}_a.png")
+    lo, hi = np.percentile(rec["img_b"], (0.5, 99.5))
+    x = (rec["img_b"].astype(np.float32) - lo) / max(1e-6, hi - lo)
+    Image.fromarray((np.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+        f"{stem}_b.png")
+
+
+def run_split_images(sampler: "PairSampler", count: int, split: str,
+                     out_dir: Path) -> dict:
+    """Generate ``count`` pairs of ``split`` straight to PNG + TXT files.
+
+    Returns the same summary dict as ``run_split`` (stats over the labels),
+    without writing any numpy arrays.
+    """
+    split_dir = out_dir / split
+    split_dir.mkdir(parents=True, exist_ok=True)
+    size = sampler.args.size
+    labels = np.zeros((count, 3), dtype=np.float64)
+    stars_a = np.zeros(count)
+    fov = np.zeros(count)
+    t0 = time.perf_counter()
+    seed = sampler.args.seed + 10_000_000 * (0 if split == "train" else 1)
+
+    for i in range(count):
+        frame_no = 1 + i * 2 + (10_000_003 if split != "train" else 0)
+        rec = sampler.next_pair(frame_no, seed + i * 7919)
+        export_pair_images(split, i, rec, size, split_dir)
+        labels[i] = rec["label"]
+        stars_a[i] = rec["stars_a"]
+        fov[i] = rec["fov"]
+        if (i + 1) % 25 == 0 or i == count - 1:
+            el = time.perf_counter() - t0
+            print(
+                f"  {split} {i + 1}/{count}   {el:6.1f}s elapsed  "
+                f"avg {(el / (i + 1)) * 1e3:.0f} ms/pair",
+                flush=True,
+            )
+
+    return {
+        "split": split,
+        "count": int(count),
+        "mean_abs_dx": float(np.mean(np.abs(labels[:, 0]))),
+        "mean_abs_dy": float(np.mean(np.abs(labels[:, 1]))),
+        "mean_abs_droll": float(np.mean(np.abs(labels[:, 2]))),
+        "max_abs_dx": float(np.max(np.abs(labels[:, 0]))),
+        "max_abs_droll": float(np.max(np.abs(labels[:, 2]))),
+        "stars_a": float(stars_a.mean()),
+        "fov": float(fov.mean()),
+    }
+
+
 def run_split(
     sampler: PairSampler,
     count: int,
@@ -470,6 +569,78 @@ def run_split(
     }
 
 
+def add_smoke_group(p: argparse.ArgumentParser) -> None:
+    """Small independent test dataset in its own folder (never touches --out)."""
+    g = p.add_argument_group("smoke test dataset")
+    g.add_argument("--smoke", action="store_true",
+                   help="also generate a small independent smoke-test dataset "
+                        "into --smoke-out as PNG images + text labels "
+                        "(separate RNG stream, so the main dataset is unaffected)")
+    g.add_argument("--smoke-out", type=Path, default=HERE / "data_smoke",
+                   help="folder for the image/text smoke-test dataset "
+                        "(default: data_smoke)")
+    g.add_argument("--smoke-size", type=int, default=96,
+                   help="pixel size of the smoke frames")
+    g.add_argument("--smoke-train", type=int, default=16,
+                   help="smoke train pairs")
+    g.add_argument("--smoke-val", type=int, default=8,
+                   help="smoke val pairs")
+    g.add_argument("--smoke-test", type=int, default=8,
+                   help="smoke test pairs")
+
+
+def run_smoke(catalog: tuple, args) -> None:
+    """Generate the independent smoke-test dataset into args.smoke_out.
+
+    Data is stored as *directly usable images + text* (one PNG pair + one TXT
+    label file per sample, per split sub-folder) - no numpy arrays. Uses its
+    own RNG stream (seed + fixed offset) and a fresh sampler, so toggling
+    --smoke never perturbs the main dataset's samples.
+    """
+    out = args.smoke_out
+    if out.exists():
+        shutil.rmtree(out)  # drop any stale numpy layout from previous runs
+    out.mkdir(parents=True, exist_ok=True)
+    sa = argparse.Namespace(**vars(args))
+    sa.size = args.smoke_size
+    sa.seed = args.seed + 8_000_017
+    sampler = PairSampler(catalog, sa)
+    t0 = time.perf_counter()
+    summaries = []
+    for split, n in (("train", args.smoke_train),
+                     ("val", args.smoke_val),
+                     ("test", args.smoke_test)):
+        if n <= 0:
+            continue
+        s = run_split_images(sampler, n, split, out)
+        summaries.append(s)
+    print(f"\nsmoke total {time.perf_counter() - t0:.1f}s")
+
+    params_txt = (
+        "smoke test dataset (images + text labels)\n"
+        f"pixel size      {sa.size}\n"
+        f"fov range       {sa.fov_min:.1f} - {sa.fov_max:.1f} deg\n"
+        f"offset fraction {sa.offset_frac_min} - {sa.offset_frac_max} of FOV\n"
+        f"max |roll error| {sa.max_roll} deg\n"
+        f"seed            {sa.seed}\n"
+        f"\n"
+        f"label convention (per <index>.txt):\n"
+        f"  dx, dy   A's centre appears at B's centre + (dx, dy) px\n"
+        f"  droll    B roll - A roll, deg\n"
+        f"\n"
+    )
+    for s in summaries:
+        print(s)
+        params_txt += (
+            f"{s['split']:<6} {s['count']:>4} pairs   "
+            f"mean |dx| {s['mean_abs_dx']:.2f}  mean |dy| {s['mean_abs_dy']:.2f}  "
+            f"mean |droll| {s['mean_abs_droll']:.2f} deg   "
+            f"mean stars {s['stars_a']:.1f}   mean FOV {s['fov']:.2f} deg\n"
+        )
+    (out / "params.txt").write_text(params_txt)
+    print(f"smoke dataset written to {out}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, default=HERE / "data")
@@ -478,6 +649,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train", type=int, default=600)
     p.add_argument("--val", type=int, default=80)
     p.add_argument("--test", type=int, default=80)
+    add_smoke_group(p)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--fov-min", type=float, default=1.5)
     p.add_argument("--fov-max", type=float, default=8.0)
@@ -514,21 +686,25 @@ def main() -> None:
             continue
         s = run_split(sampler, n, split, args.out, t0, args.check_dir, args.check_count)
         summaries.append(s)
-    print(f"\ntotal {time.perf_counter() - t0:.1f}s")
 
-    with (args.out / "params.json").open("w") as f:
-        json.dump(
-            {
-                "size": args.size,
-                "splits": summaries,
-                "label": "dx,dy = A-centre in B frame minus B-centre (px); droll = B-A (deg)",
-                "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-            },
-            f,
-            indent=2,
-        )
-    for s in summaries:
-        print(s)
+    if summaries:
+        print(f"\ntotal {time.perf_counter() - t0:.1f}s")
+        with (args.out / "params.json").open("w") as f:
+            json.dump(
+                {
+                    "size": args.size,
+                    "splits": summaries,
+                    "label": "dx,dy = A-centre in B frame minus B-centre (px); droll = B-A (deg)",
+                    "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+                },
+                f,
+                indent=2,
+            )
+        for s in summaries:
+            print(s)
+
+    if args.smoke:
+        run_smoke((ra, dec, mag), args)
 
 
 if __name__ == "__main__":

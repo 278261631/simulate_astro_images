@@ -5,11 +5,21 @@ Workflow
 --------
 1. Point at a trained checkpoint (a plain ``best.pt`` state dict or a full
    ``checkpoint_best.pt`` dict produced by ``train.py``) and at a dataset
-   directory produced by ``generate_dataset.py`` (defaults to ``models/`` and
-   ``data/`` next to this script).
+   directory.  Two layouts are auto-detected per split:
+
+   * numpy dataset from ``generate_dataset.py`` (default ``data/``):
+     ``<split>_a.npy`` + ``<split>_b.npy`` + ``<split>_labels.npy``
+   * image/text smoke dataset from ``generate_smoke_data.bat`` (default
+     ``data_smoke/``): sub-folder ``<split>/`` holding one ``<n>_a.png`` /
+     ``<n>_b.png`` pair plus ``<n>.txt`` label per sample.
+
 2. Pick a split (train / val / test) and press *Run split*. Every pair is
    scored in a background thread and an error table + summary metrics are
-   shown (same statistics ``train.py`` prints).
+   shown (same statistics ``train.py`` prints).  Images smaller than the
+   model's native 192 px (e.g. the 96 px smoke set) are resampled to 192 px
+   for inference; predicted pixel offsets are scaled back to the original
+   image scale so the GT comparison stays in the dataset's pixels.
+
 3. Click a table row to inspect that pair:
        A             frame A, display stretched
        B             frame B, display stretched
@@ -17,8 +27,7 @@ Workflow
                      in red blended over A in green
        Pred align    same but with the *predicted* transform
    Where the two channels coincide the blend looks neutral/yellow; residual
-   mis-registration shows up as red or green fringes on star edges, so you can
-   judge alignment quality at a glance.
+   mis-registration shows up as red or green fringes on star edges.
 
 Run:
     python validate_model_gui.py
@@ -27,6 +36,7 @@ Run:
 from __future__ import annotations
 
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -63,16 +73,13 @@ if str(HERE) not in sys.path:
 from model import PairRegNet, decode, preprocess  # noqa: E402
 
 DEFAULT_MODEL = HERE / "models" / "best.pt"
-DEFAULT_DATA = HERE / "data"
+DEFAULT_DATA = HERE / "data_smoke"
+MODEL_SIZE = 192  # pixel size the network was trained on
 
 
 # ---------------------------------------------------------------------------
-# Small shared helpers (duplicated from train.py so the GUI is self-contained)
+# Metrics / formatting (duplicated from train.py so the GUI is self-contained)
 # ---------------------------------------------------------------------------
-
-
-def wrap180(a: np.ndarray) -> np.ndarray:
-    return ((a + 180.0) % 360.0) - 180.0
 
 
 def error_metrics(pred: np.ndarray, lab: np.ndarray) -> dict:
@@ -122,6 +129,180 @@ def load_checkpoint(path: Path) -> tuple[PairRegNet, dict | None]:
     net.load_state_dict(sd)
     net.eval()
     return net, info
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading (numpy layout OR data_smoke image/text layout)
+# ---------------------------------------------------------------------------
+
+
+class SplitData:
+    """Uniform handle over a split, whichever layout produced it."""
+
+    def __init__(self, a: np.ndarray, b: np.ndarray, labels: np.ndarray,
+                 meta_rows: list[dict | None]) -> None:
+        self.a = a
+        self.b = b
+        self.labels = np.asarray(labels, dtype=np.float64)
+        self.meta_rows = meta_rows
+        self.n = len(a)
+
+    @property
+    def size(self) -> int:
+        return self.a.shape[1]
+
+    def images(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+        return self.a[i], self.b[i]
+
+    def meta(self, i: int) -> dict:
+        row = self.meta_rows[i]
+        return dict(row) if row else {}
+
+
+def _numpy_meta_rows(n: int, npz: dict) -> list[dict]:
+    """Per-sample meta dicts from a generate_dataset *_meta.npz file."""
+    rows = []
+    for i in range(n):
+        m = {}
+        for k in ("ra0", "dec0", "roll_a", "roll_b", "fov", "offset_frac",
+                  "seed", "stars_a", "stars_b"):
+            arr = npz.get(k)
+            if arr is not None and i < len(arr):
+                v = arr[i]
+                m[k] = float(v) if k in ("fov", "offset_frac") else (
+                    int(v) if k in ("seed", "stars_a", "stars_b") else float(v))
+        rows.append(m)
+    return rows
+
+
+def load_numpy_split(data_dir: Path, split: str) -> SplitData:
+    data_dir = Path(data_dir)
+    a = np.load(data_dir / f"{split}_a.npy")
+    b = np.load(data_dir / f"{split}_b.npy")
+    lab = np.load(data_dir / f"{split}_labels.npy")
+    meta = {}
+    meta_path = data_dir / f"{split}_meta.npz"
+    if meta_path.exists():
+        meta = {k: np.load(meta_path)[k] for k in np.load(meta_path).files}
+    return SplitData(a, b, lab, _numpy_meta_rows(len(a), meta))
+
+
+_TXT_LABEL_RE = re.compile(
+    r"label\s+dx\s+([+-]?[0-9.]+)\s+px\s+dy\s+([+-]?[0-9.]+)\s+px"
+    r"\s+droll\s+([+-]?[0-9.]+)\s+deg",
+    re.IGNORECASE,
+)
+
+
+def _txt_meta(path: Path) -> tuple[dict, tuple[float, float, float]]:
+    """Parse one data_smoke <n>.txt label/geometry file -> (meta, (dx, dy, droll))."""
+    txt = path.read_text(encoding="utf-8", errors="replace")
+    m = {}
+
+    def grab(pattern: str, key: str, conv=float) -> None:
+        r = re.search(pattern, txt, re.IGNORECASE)
+        if r:
+            m[key] = conv(r.group(1))
+
+    r2 = re.search(r"A center RA/Dec\s+([-0-9.]+)\s+deg\s+([-0-9.]+)\s+deg",
+                   txt, re.IGNORECASE)
+    if r2:
+        m["ra0"], m["dec0"] = float(r2.group(1)), float(r2.group(2))
+    grab(r"commanded roll A\s+([-0-9.]+)", "roll_a")
+    grab(r"actual roll B\s+([-0-9.]+)", "roll_b")
+    grab(r"FOV\s+([0-9.]+)", "fov")
+    grab(r"up to\s+([0-9.]+)\s*% of FOV", "offset_frac")
+    if "offset_frac" in m:
+        m["offset_frac"] = m["offset_frac"] / 100.0
+    rs = re.search(r"stars in frame\s+A\s+(\d+)\s+B\s+(\d+)", txt, re.IGNORECASE)
+    if rs:
+        m["stars_a"], m["stars_b"] = int(rs.group(1)), int(rs.group(2))
+    grab(r"seed\s+(\d+)", "seed", int)
+    lm = _TXT_LABEL_RE.search(txt)
+    if lm is None:
+        raise ValueError(f"no 'label dx dy droll' line in {path}")
+    label = (float(lm.group(1)), float(lm.group(2)), float(lm.group(3)))
+    return m, label
+
+
+def load_image_split(split_dir: Path) -> SplitData:
+    """Load a data_smoke/<split>/ folder of <n>_a.png / <n>_b.png / <n>.txt."""
+    split_dir = Path(split_dir)
+    try:
+        from PIL import Image
+    except Exception:
+        raise SystemExit(
+            "Pillow is required to read the image/text dataset:\n"
+            "  python -m pip install pillow"
+        )
+
+    a_files = sorted(split_dir.glob("*_a.png"))
+    if not a_files:
+        raise FileNotFoundError(f"no *_a.png files in {split_dir}")
+    idxs, arrays_a, arrays_b = [], [], []
+    meta_rows, labels = [], []
+    for fa in a_files:
+        stem = fa.name[: -len("_a.png")]
+        fb = split_dir / f"{stem}_b.png"
+        ft = split_dir / f"{stem}.txt"
+        if not fb.exists() or not ft.exists():
+            continue
+        ia = np.asarray(Image.open(fa).convert("L"), dtype=np.uint8)
+        ib = np.asarray(Image.open(fb).convert("L"), dtype=np.uint8)
+        meta, label = _txt_meta(ft)
+        idxs.append(int(stem))
+        arrays_a.append(ia)
+        arrays_b.append(ib)
+        meta_rows.append(meta)
+        labels.append(label)
+    if not arrays_a:
+        raise FileNotFoundError(f"no complete A/B/TXT pairs in {split_dir}")
+    order = np.argsort(idxs)
+    a = np.stack([arrays_a[i] for i in order])
+    b = np.stack([arrays_b[i] for i in order])
+    labels = np.asarray([labels[i] for i in order], dtype=np.float64)
+    meta_rows = [meta_rows[i] for i in order]
+    return SplitData(a, b, labels, meta_rows)
+
+
+def load_split(data_dir: Path, split: str) -> SplitData:
+    """numpy layout first, then the image/text data_smoke layout."""
+    data_dir = Path(data_dir)
+    if (data_dir / f"{split}_a.npy").exists():
+        return load_numpy_split(data_dir, split)
+    split_dir = data_dir / split
+    if split_dir.is_dir():
+        try:
+            return load_image_split(split_dir)
+        except FileNotFoundError:
+            pass
+    raise FileNotFoundError(
+        f"no dataset found for split '{split}' in {data_dir}\n"
+        f"expected either <split>_a.npy (numpy dataset) or "
+        f"{split}/<n>_a.png + <n>_b.png + <n>.txt (image/text dataset)")
+
+
+# ---------------------------------------------------------------------------
+# Inference pre-processing (resample any size to the model's 192 px grid)
+# ---------------------------------------------------------------------------
+
+
+def _to_model_scale(ia: np.ndarray, ib: np.ndarray):
+    """Return (ia, ib resized to MODEL_SIZE, px_scale).  px_scale = model px
+    per original px; predicted offsets in the original grid = prediction / it."""
+    import cv2  # noqa: PLC0415 - heavy import, kept local like predict.py
+
+    h, w = ia.shape
+    s = MODEL_SIZE / max(w, h)
+    nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    if (nw, nh) != (w, h):
+        ia = cv2.resize(ia, (nw, nh), interpolation=cv2.INTER_AREA)
+        ib = cv2.resize(ib, (nw, nh), interpolation=cv2.INTER_AREA)
+    ph, pw = MODEL_SIZE - nh, MODEL_SIZE - nw
+    pad = ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2))
+    ia = np.pad(ia, pad, mode="edge")
+    ib = np.pad(ib, pad, mode="edge")
+    return ia, ib, s
 
 
 # ---------------------------------------------------------------------------
@@ -179,32 +360,39 @@ class EvalWorker(QThread):
     done = Signal(object)                # list[dict] per-sample records
     failed = Signal(str)
 
-    def __init__(self, net: PairRegNet, a: np.ndarray, b: np.ndarray,
-                 labels: np.ndarray, meta: dict | None, batch: int = 64,
+    def __init__(self, net: PairRegNet, src: SplitData, batch: int = 64,
                  parent=None) -> None:
         super().__init__(parent)
         self.net = net
-        self.a = a
-        self.b = b
-        self.labels = labels
-        self.meta = meta
+        self.src = src
         self.batch = batch
 
     def run(self) -> None:
         try:
             t0 = time.perf_counter()
-            n = len(self.a)
-            pairs = torch.stack([preprocess(self.a[i], self.b[i]) for i in range(n)])
+            src = self.src
+            n = len(src.labels)
+            pairs = []
+            scales = np.ones(n)
+            for i in range(n):
+                ia, ib = src.images(i)
+                ia, ib, s = _to_model_scale(ia, ib)
+                scales[i] = s
+                pairs.append(preprocess(ia, ib))
+            pairs = torch.stack(pairs)
             pred = np.zeros((n, 3), dtype=np.float64)
             with torch.no_grad():
-                for s in range(0, n, self.batch):
+                for st in range(0, n, self.batch):
                     if self.isInterruptionRequested():
                         return
-                    e = min(s + self.batch, n)
-                    out = decode(self.net(pairs[s:e])).numpy()
-                    pred[s:e] = out
-                    self.progress.emit(e, n)
-            gt = self.labels
+                    en = min(st + self.batch, n)
+                    out = decode(self.net(pairs[st:en])).numpy()
+                    pred[st:en] = out
+                    self.progress.emit(en, n)
+            # convert model-grid offsets back to the dataset's pixel scale
+            pred[:, 0] /= scales
+            pred[:, 1] /= scales
+            gt = src.labels
             records = []
             for i in range(n):
                 e = pred[i] - gt[i]
@@ -241,10 +429,7 @@ class ValidatorWindow(QMainWindow):
         self.resize(1320, 920)
 
         self.net: PairRegNet | None = None
-        self.split_a: np.ndarray | None = None
-        self.split_b: np.ndarray | None = None
-        self.split_lab: np.ndarray | None = None
-        self.split_meta: dict | None = None
+        self.src: SplitData | None = None
         self.records: list[dict] = []
         self.worker: EvalWorker | None = None
 
@@ -271,11 +456,7 @@ class ValidatorWindow(QMainWindow):
     def _build_top(self) -> QHBoxLayout:
         top = QHBoxLayout()
 
-        def label(text: str) -> QLabel:
-            lb = QLabel(text)
-            return lb
-
-        top.addWidget(label("Model"))
+        top.addWidget(QLabel("Model"))
         self.ed_model = QLineEdit(str(DEFAULT_MODEL))
         self.ed_model.setMinimumWidth(360)
         top.addWidget(self.ed_model)
@@ -288,7 +469,7 @@ class ValidatorWindow(QMainWindow):
         top.addWidget(bt_load)
 
         top.addSpacing(16)
-        top.addWidget(label("Data dir"))
+        top.addWidget(QLabel("Data dir"))
         self.ed_data = QLineEdit(str(DEFAULT_DATA))
         self.ed_data.setMinimumWidth(280)
         top.addWidget(self.ed_data)
@@ -328,8 +509,7 @@ class ValidatorWindow(QMainWindow):
 
         titles = ["A", "B", "B aligned to A  (ground truth)", "B aligned to A  (prediction)"]
         self._panes = {}
-        pos = [(0, 0), (0, 1), (1, 0), (1, 1)]
-        for t, (r, c) in zip(titles, pos):
+        for t, (r, c) in zip(titles, [(0, 0), (0, 1), (1, 0), (1, 1)]):
             gb, lb = pane(t)
             self._panes[t] = lb
             grid.addWidget(gb, r, c)
@@ -402,34 +582,27 @@ class ValidatorWindow(QMainWindow):
             return
         data_dir = Path(self.ed_data.text())
         split = self.cmb_split.currentText()
-        for suffix in ("_a", "_b", "_labels"):
-            if not (data_dir / f"{split}{suffix}.npy").exists():
-                QMessageBox.warning(
-                    self, "dataset",
-                    f"missing {split}{suffix}.npy in:\n{data_dir}")
-                return
+        if not data_dir.is_dir():
+            QMessageBox.warning(self, "dataset", f"folder not found:\n{data_dir}")
+            return
+        try:
+            self.src = load_split(data_dir, split)
+        except Exception as exc:
+            QMessageBox.warning(self, "dataset", str(exc))
+            return
         if self.worker is not None and self.worker.isRunning():
             return
 
-        a = np.load(data_dir / f"{split}_a.npy")
-        b = np.load(data_dir / f"{split}_b.npy")
-        lab = np.load(data_dir / f"{split}_labels.npy")
-        meta = {}
-        meta_path = data_dir / f"{split}_meta.npz"
-        if meta_path.exists():
-            meta = {k: np.load(meta_path)[k] for k in
-                    ("ra0", "dec0", "roll_a", "roll_b", "fov", "offset_frac",
-                     "seed", "stars_a", "stars_b")}
-
-        self.split_a, self.split_b, self.split_lab, self.split_meta = a, b, lab, meta
+        src = self.src
         self.status.setText(
-            f"evaluating {split} split: {len(a)} pairs, size {a.shape[1]} px \u2026")
-        self.progress.setRange(0, len(a))
+            f"evaluating {split} split: {src.n} pairs, size {src.size} px "
+            f"({data_dir}) \u2026")
+        self.progress.setRange(0, src.n)
         self.progress.setValue(0)
         self.bt_run.setEnabled(False)
         self._clear_table()
 
-        self.worker = EvalWorker(self.net, a, b, lab, meta, parent=self)
+        self.worker = EvalWorker(self.net, src, parent=self)
         self.worker.progress.connect(lambda cur, tot: self.progress.setValue(cur))
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
@@ -448,8 +621,11 @@ class ValidatorWindow(QMainWindow):
         zero = np.zeros_like(lab)
         base = error_metrics(zero, lab)
         el = records[0]["elapsed"]
+        scale_note = ""
+        if self.src is not None and self.src.size != MODEL_SIZE:
+            scale_note = f"\n{self.src.size}px frames resampled to {MODEL_SIZE}px for inference"
         self.lbl_summary.setText(
-            f"{self.cmb_split.currentText()}  {n} pairs  ({el:.1f}s)\n"
+            f"{self.cmb_split.currentText()}  {n} pairs  ({el:.1f}s){scale_note}\n"
             f"baseline (predict zeros): {fmt_metrics(base)}\n"
             f"model:                    {fmt_metrics(m)}")
         self.status.setText("done")
@@ -504,8 +680,11 @@ class ValidatorWindow(QMainWindow):
         self._show_pair(r["i"], r)
 
     def _show_pair(self, idx: int, r: dict) -> None:
-        a = display_stretch(self.split_a[idx])
-        b = display_stretch(self.split_b[idx])
+        if self.src is None or not (0 <= idx < self.src.n):
+            return
+        ia, ib = self.src.images(idx)
+        a = display_stretch(ia)
+        b = display_stretch(ib)
         gt_b = warp_b_onto_a(b, r["gt_dx"], r["gt_dy"], r["gt_roll"])
         pr_b = warp_b_onto_a(b, r["dx"], r["dy"], r["roll"])
         self._panes["A"].setPixmap(to_pixmap(a, 420))
@@ -515,21 +694,18 @@ class ValidatorWindow(QMainWindow):
         self._panes["B aligned to A  (prediction)"].setPixmap(
             to_pixmap(blend_ab(a, pr_b), 420))
 
-        meta = self.split_meta or {}
-        has = {k: k in meta and len(meta[k]) > idx for k in
-               ("ra0", "dec0", "roll_a", "roll_b", "fov", "offset_frac",
-                "seed", "stars_a", "stars_b")}
+        m = self.src.meta(idx)
         info = (
-            f"pair {idx}/{len(self.split_a) - 1}"
-            + (f"   RA {meta['ra0'][idx]:.4f}\u00b0  Dec {meta['dec0'][idx]:.4f}\u00b0"
-               f"  FOV {meta['fov'][idx]:.3f}\u00b0" if has["fov"] else "")
-            + (f"  roll A {meta['roll_a'][idx]:.2f}\u00b0 -> B {meta['roll_b'][idx]:.2f}\u00b0"
-               if has["roll_b"] else "")
-            + (f"  offset up to {meta['offset_frac'][idx] * 100:.1f}% FOV"
-               if has["offset_frac"] else "")
-            + (f"  stars {meta['stars_a'][idx]} / {meta['stars_b'][idx]}"
-               if has["stars_b"] else "")
-            + (f"  seed {int(meta['seed'][idx])}" if has["seed"] else "")
+            f"pair {idx}/{self.src.n - 1}"
+            + (f"   RA {m['ra0']:.4f}\u00b0  Dec {m['dec0']:.4f}\u00b0"
+               f"  FOV {m['fov']:.3f}\u00b0" if "fov" in m and "ra0" in m else "")
+            + (f"  roll A {m['roll_a']:.2f}\u00b0 -> B {m['roll_b']:.2f}\u00b0"
+               if "roll_a" in m and "roll_b" in m else "")
+            + (f"  offset up to {m['offset_frac'] * 100:.1f}% FOV"
+               if "offset_frac" in m else "")
+            + (f"  stars {m['stars_a']} / {m['stars_b']}"
+               if "stars_a" in m and "stars_b" in m else "")
+            + (f"  seed {m['seed']}" if "seed" in m else "")
             + "\n"
             + f"GT   dx {r['gt_dx']:+.3f}  dy {r['gt_dy']:+.3f}  roll {r['gt_roll']:+.3f}\u00b0\n"
             + f"pred dx {r['dx']:+.3f}  dy {r['dy']:+.3f}  roll {r['roll']:+.3f}\u00b0"
