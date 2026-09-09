@@ -68,6 +68,33 @@ DEFAULT_CATALOG = HERE.parent / "data" / "hip_catalog.csv"
 # luminance weights used when storing the RGB (H, W, 3) frames as grayscale
 _LUM = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
+# transient-source bookkeeping
+MAX_TRANSIENTS = 8                     # per-pair cap stored in *_meta.npz
+T_CLS = {"new": 0, "brighten": 1, "move": 2}
+
+
+def _tangent_xy_in_frame(ra_t: float, dec_t: float, geo: dict, fov: float,
+                         margin: float = 0.98):
+    """Project one physical (ra, dec) point into ``geo``'s frame; return
+    post-roll tangent-plane (x, y) if inside the FOV, else None."""
+    half = math.tan(math.radians(float(fov) / 2.0))
+    x, y, vis = gnomonic_project(
+        np.asarray([ra_t]), np.asarray([dec_t]), geo["ra"], geo["dec"])
+    if not bool(vis[0]):
+        return None
+    x, y = apply_roll(x, y, geo["roll"])
+    if abs(x[0]) > half * margin or abs(y[0]) > half * margin:
+        return None
+    return float(x[0]), float(y[0])
+
+
+def _tangent_to_px(x: float, y: float, fov: float, size: int) -> tuple[float, float]:
+    """Tangent-plane (x, y) (post-roll) -> pixel centre in a ``size`` square."""
+    half = math.tan(math.radians(float(fov) / 2.0))
+    px = ((x + half) / (2.0 * half)) * (size - 1)
+    py = ((half - y) / (2.0 * half)) * (size - 1)
+    return float(px), float(py)
+
 
 def gnomonic_inverse_pt(x: float, y: float, ra0_deg: float, dec0_deg: float):
     """(x, y) tangent plane offset (radian-ish units, =tan of angle) -> ra/dec."""
@@ -202,12 +229,24 @@ def project_stars(ra_all, dec_all, mag_all, snap):
     }
 
 
-def render_frame(snap: dict, art: dict, stars: dict) -> np.ndarray:
-    """(H, W, 3) float RGB in [0, 1] after PSF rendering + sky effects."""
+def render_frame(snap: dict, art: dict, stars: dict,
+                 extra: tuple | None = None) -> np.ndarray:
+    """(H, W, 3) float RGB in [0, 1] after PSF rendering + sky effects.
+
+    ``extra`` = (x, y, mag) tangent-plane arrays of additional point sources
+    (transients) rendered through the exact same PSF/tone-map as catalogue
+    stars, but excluded from the spike/ghost bookkeeping (``eff_stars``).
+    """
+    if extra is not None and len(extra[0]) > 0:
+        xs = np.concatenate([stars["x"], extra[0]])
+        ys = np.concatenate([stars["y"], extra[1]])
+        ms = np.concatenate([stars["mag"], extra[2]])
+    else:
+        xs, ys, ms = stars["x"], stars["y"], stars["mag"]
     rgb = render_psf_image(
-        x=stars["x"],
-        y=stars["y"],
-        mag=stars["mag"],
+        x=xs,
+        y=ys,
+        mag=ms,
         half_extent=math.tan(math.radians(float(snap["fov"]) / 2.0)),
         width_px=int(snap["width"]),
         height_px=int(snap["height"]),
@@ -241,6 +280,81 @@ class PairSampler:
         self.roll_max = args.max_roll
         self.frac_lo = args.offset_frac_min
         self.frac_hi = args.offset_frac_max
+
+    def sample_transients(self, rng: np.random.RandomState, size: int, fov: float,
+                          geo_a: dict, geo_b: dict) -> dict | None:
+        """Sample transient sources for one A/B pair.
+
+        Physical sources live in the sky (defined relative to A's centre);
+        each frame projects them with its own geometry, so a stationary
+        transient sits on the *same* catalogue-stars grid in both frames (no
+        mapping error), while a moving one is given its own B-frame position.
+
+        Returned extras are rendered in both frames via ``render_frame``; the
+        ground truth (for the detection head) is the source position **in
+        frame B's pixels** + class:
+            0 new       - visible in B only
+            1 brighten  - faint in A, bright in B (same sky position)
+            2 move      - bright in both frames, B position displaced
+        """
+        rate = float(getattr(self.args, "transient_rate", 0.0))
+        if rate <= 0.0:
+            return None
+        n = int(rng.poisson(rate))
+        if n > MAX_TRANSIENTS:
+            n = MAX_TRANSIENTS
+        if n <= 0:
+            return None
+        half = math.tan(math.radians(float(fov) / 2.0))
+        xa, ya, ma, xb, yb, mb = [], [], [], [], [], []
+        gt: list[tuple[float, float, float]] = []
+        for _ in range(n):
+            cls = int(rng.choice([0, 1, 2], p=[0.4, 0.35, 0.25]))
+            # position inside ~70% of the field so B's pointing offset/roll
+            # (and any motion) keeps the source inside both frames.
+            rho = half * 0.70 * math.sqrt(rng.uniform(0.0, 1.0))
+            phi = rng.uniform(0.0, 2.0 * math.pi)
+            u, v = rho * math.cos(phi), rho * math.sin(phi)
+            ra_a, dec_a = gnomonic_inverse_pt(u, v, geo_a["ra"], geo_a["dec"])
+            mag_a = 99.0
+            mag_b = 99.0
+            du = dv = 0.0
+            if cls == T_CLS["new"]:
+                mag_b = float(rng.uniform(1.0, 6.0))
+            elif cls == T_CLS["brighten"]:
+                mag_a = float(rng.uniform(7.5, 10.5))
+                mag_b = float(rng.uniform(1.0, 6.0))
+            else:  # move
+                mag_a = float(rng.uniform(3.5, 7.0))
+                mag_b = float(rng.uniform(1.5, 6.0))
+                ang = rng.uniform(0.0, 2.0 * math.pi)
+                dist = half * rng.uniform(0.04, 0.16)
+                du, dv = dist * math.cos(ang), dist * math.sin(ang)
+
+            if cls == T_CLS["move"]:
+                ra_b, dec_b = gnomonic_inverse_pt(
+                    u + du, v + dv, geo_a["ra"], geo_a["dec"])
+            else:
+                ra_b, dec_b = ra_a, dec_a
+
+            pA = _tangent_xy_in_frame(ra_a, dec_a, geo_a, fov)
+            pB = _tangent_xy_in_frame(ra_b, dec_b, geo_b, fov)
+            if pA is None or pB is None:
+                continue
+            px_b, py_b = _tangent_to_px(pB[0], pB[1], fov, size)
+            if not (0.0 <= px_b < size and 0.0 <= py_b < size):
+                continue
+            if mag_a < 90.0:
+                xa.append(pA[0]); ya.append(pA[1]); ma.append(mag_a)
+            xb.append(pB[0]); yb.append(pB[1]); mb.append(mag_b)
+            gt.append((px_b, py_b, float(cls)))
+
+        if not gt:
+            return None
+        ex_a = (np.asarray(xa), np.asarray(ya), np.asarray(ma)) if xa else None
+        ex_b = (np.asarray(xb), np.asarray(yb), np.asarray(mb)) if xb else None
+        return {"extra_a": ex_a, "extra_b": ex_b,
+                "gt": np.asarray(gt, dtype=np.float64)}
 
     def next_pair(self, frame_no: int, seed: int, size: int | None = None) -> dict:
         """Build one pair. Returns record with A/B geometry + images.
@@ -295,6 +409,8 @@ class PairSampler:
         roll_b = wrap_deg(geo_a["roll"] + droll)
         geo_b = {"ra": float(ra_b), "dec": float(dec_b), "roll": roll_b}
 
+        trans = self.sample_transients(rng, size, fov, geo_a, geo_b)
+
         art_a = dict(art)
         art_a["frame"] = frame_no
         art_b = dict(art)
@@ -302,7 +418,8 @@ class PairSampler:
 
         snap_a = dict(snap)
         snap_a.update(geo_a)
-        rgb_a = render_frame(snap_a, art_a, stars_a)
+        rgb_a = render_frame(snap_a, art_a, stars_a,
+                             extra=trans["extra_a"] if trans else None)
 
         probe_b = dict(snap)
         probe_b.update(geo_b)
@@ -310,10 +427,11 @@ class PairSampler:
         if stars_b is None:
             probe_b["min_stars"] = 0
             stars_b = project_stars(self.ra_all, self.dec_all, self.mag_all, probe_b)
-        rgb_b = render_frame(snap, art_b, stars_b)
+        rgb_b = render_frame(snap, art_b, stars_b,
+                             extra=trans["extra_b"] if trans else None)
 
         dx, dy = self.a_center_in_b_px(geo_a, geo_b, fov, size)
-        return {
+        rec = {
             "img_a": to_gray_u8(rgb_a),
             "img_b": to_gray_u8(rgb_b),
             "label": (float(dx), float(dy), wrap_deg(roll_b - geo_a["roll"])),
@@ -328,6 +446,9 @@ class PairSampler:
             "stars_a": stars_a["count"],
             "stars_b": stars_b["count"] if stars_b is not None else 0,
         }
+        if trans is not None:
+            rec["gt_trans"] = trans["gt"]     # (K, 3) pxB_x, pxB_y, cls
+        return rec
 
     @staticmethod
     def a_center_in_b_px(geo_a: dict, geo_b: dict, fov: float, size: int) -> tuple[float, float]:
@@ -537,6 +658,11 @@ def run_split(
         "stars_a": np.zeros(count, dtype=np.int32),
         "stars_b": np.zeros(count, dtype=np.int32),
     }
+    # transient ground truth (padded with -1 to MAX_TRANSIENTS per sample)
+    meta["trans_n"] = np.zeros(count, dtype=np.int32)
+    meta["trans_x"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    meta["trans_y"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    meta["trans_cls"] = np.full((count, MAX_TRANSIENTS), -1.0)
     seed = sampler.args.seed + 10_000_000 * (0 if split == "train" else 1)
 
     for i in range(count):
@@ -556,6 +682,13 @@ def run_split(
         meta["seed"][i] = rec["seed"]
         meta["stars_a"][i] = rec["stars_a"]
         meta["stars_b"][i] = rec["stars_b"]
+        gt = rec.get("gt_trans")
+        if gt is not None and len(gt):
+            k = min(len(gt), MAX_TRANSIENTS)
+            meta["trans_n"][i] = k
+            meta["trans_x"][i, :k] = gt[:k, 0]
+            meta["trans_y"][i, :k] = gt[:k, 1]
+            meta["trans_cls"][i, :k] = gt[:k, 2]
         if (i + 1) % 25 == 0 or i == count - 1:
             el = time.perf_counter() - t0
             print(
@@ -687,6 +820,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--offset-frac-max", type=float, default=0.08)
     p.add_argument("--max-roll", type=float, default=8.0,
                    help="max |roll error| between A and B in degrees")
+    p.add_argument("--transient-rate", type=float, default=1.2,
+                   help="mean number of transient sources per pair (Poisson); "
+                        "0 disables transient simulation. Classes: new / "
+                        "brighten / move, GT stored in *_meta.npz as "
+                        "trans_x/trans_y/trans_cls (position in B-frame px)")
     p.add_argument("--min-stars", type=int, default=5)
     p.add_argument("--psf-sigma-min", type=float, default=0.7,
                    help="lower PSF sigma bound (px) sampled per frame")

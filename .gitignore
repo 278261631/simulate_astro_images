@@ -213,3 +213,7 @@ __marimo__/
 /train_and_data/data
 /train_and_data/models
 /train_and_data/data_smoke
+/train_and_data/models_tr
+/train_and_data/models_base256
+/train_and_data/data256
+/train_and_data/data_tr

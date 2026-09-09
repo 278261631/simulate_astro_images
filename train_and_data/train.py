@@ -29,7 +29,14 @@ from torch.nn import functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from model import PairRegNet, decode, encode_target, preprocess  # noqa: E402
+from model import (  # noqa: E402
+    DET_STRIDE,
+    PairRegNet,
+    decode,
+    encode_target,
+    heat_to_peaks,
+    preprocess,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -215,19 +222,25 @@ def rotate_180(pair: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch
 
 
 _AUGS = (horizontal_flip, vertical_flip, rotate_180)
+_AUG_DIMS = {horizontal_flip: [2], vertical_flip: [1], rotate_180: [1, 2]}
 
 
 def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
-                 p_crop: float = 0.0):
+                 p_crop: float = 0.0, hmap: torch.Tensor | None = None):
     """Augment one (2, H, W) pair (+ its (4,) encoded target) on the CPU.
 
     ``crop``: fixed-size random-location crop applied identically to both
     frames (a pure translation, so dx/dy/droll are unchanged). Mirrors and
     180 rotations flip the dx/dy/roll signs accordingly; photometric jitter
     and light noise are per channel/frame.
+
+    ``hmap``: optional per-class heatmap target (C, gy, gx) which is spatially
+    flipped *together* with the frames so transient GT stays consistent (crop
+    and heatmaps are mutually exclusive: only full-frame flips are supported).
+    Returns ``(pair, y)`` or ``(pair, y, hmap)``.
     """
     h, w = pair.shape[1:]
-    if crop is not None and 0 < crop < h and np.random.rand() < p_crop:
+    if hmap is None and crop is not None and 0 < crop < h and np.random.rand() < p_crop:
         y0 = int(np.random.randint(0, h - crop + 1))
         x0 = int(np.random.randint(0, w - crop + 1))
         pair = pair[:, y0 : y0 + crop, x0 : x0 + crop]
@@ -235,6 +248,8 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
     if np.random.rand() < 0.5:
         aug = _AUGS[int(np.random.randint(0, len(_AUGS)))]
         pair, y = aug(pair, y)
+        if hmap is not None:
+            hmap = torch.flip(hmap, dims=_AUG_DIMS[aug])
     # photometric: per-image brightness/contrast jitter + slight noise
     for c in range(2):
         s = float(np.random.uniform(0.7, 1.3))
@@ -243,6 +258,8 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
             pair[c] = pair[c] + float(np.random.uniform(-0.03, 0.03))
         if np.random.rand() < 0.3:
             pair[c] = pair[c] + torch.randn_like(pair[c]) * 0.01
+    if hmap is not None:
+        return pair, y, hmap
     return pair, y
 
 
@@ -305,27 +322,174 @@ def fmt(m: dict) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Transient detection: heatmap targets / loss / metrics
+# ---------------------------------------------------------------------------
+#
+# GT lives in the dataset's native pixels (``trans_x/y`` in *_meta.npz).  The
+# detection head works on the stride-8 model-input grid, so targets are built
+# by binning native pixel coords /8 into a (C, gy, gx) tensor of soft Gaussian
+# blobs.  Only supported in native mode (model_in == src); with ROI resampling
+# the detection loss is simply disabled (head stays untrained).
+
+
+def build_heat_targets(meta: dict, n: int, grid: int, sigma: float = 1.2,
+                       n_cls: int = 3) -> torch.Tensor | None:
+    """(n, C, grid, grid) int8 target tensor from meta trans arrays.
+
+    CenterNet-style supervision: +1 at the source centre cell (radius ~1),
+    -1 in the ignore ring around it (not penalised either way), 0 elsewhere.
+    This avoids the dilute ring gradients of soft Gaussians and gives the
+    head a sharp positive target to drive peaks above threshold.
+    """
+    if "trans_n" not in meta:
+        return None
+    tn = np.asarray(meta["trans_n"], dtype=np.int64)[:n]
+    tx = np.asarray(meta["trans_x"])
+    ty = np.asarray(meta["trans_y"])
+    tc = np.asarray(meta["trans_cls"])
+    out = np.zeros((n, n_cls, grid, grid), dtype=np.int8)
+    for i in range(n):
+        k = int(tn[i])
+        if k <= 0:
+            continue
+        for j in range(k):
+            if j >= tx.shape[1]:
+                break
+            cx = float(tx[i, j]) / float(DET_STRIDE)
+            cy = float(ty[i, j]) / float(DET_STRIDE)
+            cl = int(round(float(tc[i, j])))
+            if not (0 <= cl < n_cls) or not (0 <= cx < grid) or not (0 <= cy < grid):
+                continue
+            x0 = max(0, int(math.floor(cy)) - 2)
+            x1 = min(grid, int(math.ceil(cy)) + 3)
+            y0 = max(0, int(math.floor(cx)) - 2)
+            y1 = min(grid, int(math.ceil(cx)) + 3)
+            for yy in range(x0, x1):
+                for xx in range(y0, y1):
+                    d = math.hypot(yy - cy, xx - cx)
+                    if d <= 0.8:
+                        out[i, cl, yy, xx] = 1
+                    elif d <= 1.8 and out[i, cl, yy, xx] == 0:
+                        out[i, cl, yy, xx] = -1
+    return torch.as_tensor(out)
+
+
+class TransientHeatLoss(nn.Module):
+    """Focal loss on binary heatmaps with an ignore ring (target -1)."""
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.25,
+                 neg_w: float = 1.0) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.neg_w = neg_w
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        p = torch.sigmoid(logits).clamp(1e-4, 1.0 - 1e-4)
+        y = target
+        pos = y > 0.5
+        ign = y < -0.5   # ignore ring
+        lpos = -self.alpha * ((1.0 - p) ** self.gamma) * torch.log(p)
+        lneg = -(1.0 - self.alpha) * (p ** self.gamma) * torch.log(1.0 - p)
+        loss = torch.zeros((), device=logits.device)
+        if pos.any():
+            loss = loss + lpos[pos].mean()
+        negc = ~pos & ~ign
+        if negc.any():
+            # hard-negative mining: penalise only the strongest false alarms,
+            # so the head collapses its background instead of averaging it.
+            vals = lneg[negc]
+            k = min(256, vals.numel())
+            loss = loss + self.neg_w * vals.topk(k).values.mean()
+        return loss
+
+
+def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
+                n_cls: int = 3) -> dict | None:
+    """Peak-matching precision / recall per class.
+
+    ``model_pred_peaks``: per-sample list of (cls, x_px, y_px, score) in model
+    grid pixels (already back to native scale by caller); ``gt``: per-sample
+    list of (x, y, cls) native px.
+    """
+    n = len(model_pred_peaks)
+    tp = np.zeros(n_cls); fp = np.zeros(n_cls); fn = np.zeros(n_cls)
+    for i in range(n):
+        gts = [(float(g[0]), float(g[1]), int(g[2])) for g in gt[i]]
+        used_g = set()
+        for (cl, x, y, s) in model_pred_peaks[i]:
+            best = None
+            for gi, (gx, gy, gcl) in enumerate(gts):
+                if gi in used_g or gcl != cl:
+                    continue
+                d = math.hypot(x - gx, y - gy)
+                if d <= tol_px and (best is None or d < best[0]):
+                    best = (d, gi)
+            if best is not None:
+                tp[cl] += 1
+                used_g.add(best[1])
+            else:
+                fp[cl] += 1
+        for gi, (gx, gy, gcl) in enumerate(gts):
+            if gi not in used_g:
+                fn[gcl] += 1
+    tot_g = sum(len(g) for g in gt)
+    tot_p = sum(len(s) for s in model_pred_peaks)
+    tp_s, fp_s, fn_s = float(tp.sum()), float(fp.sum()), float(fn.sum())
+    prec = tp_s / max(1e-9, tp_s + fp_s)
+    rec = tp_s / max(1e-9, tp_s + fn_s)
+    f1 = 2 * prec * rec / max(1e-9, prec + rec)
+    return {"det_prec": prec, "det_rec": rec, "det_f1": f1,
+            "det_tp": int(tp_s), "det_fp": int(fp_s), "det_fn": int(fn_s),
+            "det_gt": int(tot_g), "det_pred": int(tot_p)}
+
+
+def fmt_det(d: dict) -> str:
+    if d is None:
+        return "det: -"
+    return (f"det P {d['det_prec']:.2f} R {d['det_rec']:.2f} F1 {d['det_f1']:.2f}"
+            f" ({d['det_tp']}/{d['det_gt']})")
+
+
 @torch.no_grad()
-def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device, batch: int,
-             scale: float = 1.0) -> dict:
+def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
+             batch: int, scale: float = 1.0, det_gt: list | None = None,
+             det_scale: float = 1.0) -> dict:
     """pairs: (N,2,H,W) preprocessed; lab: (N,3) [dx, dy, droll_deg].
 
     ``scale`` converts the model's pixel predictions (valid in the *model
     input* coordinate grid, e.g. a down-sampled 192px view) back to the
     dataset's original pixel coordinates: multiply dx/dy by it.
+
+    If ``det_gt`` (per-sample list of (x, y, cls) native px) is given, peak
+    detection metrics are computed as well (det peaks converted to native px
+    by ``det_scale``).
     """
     model.eval()
     preds = []
+    peaks_all: list | None = [] if det_gt is not None else None
     for i in range(0, len(pairs), batch):
         pb = pairs[i : i + batch].to(device)
-        out = decode(model(pb))
+        pose, det = model(pb)
+        out = decode(pose)
         if scale != 1.0:
             out = out.clone()
             out[:, 0] = out[:, 0] * scale
             out[:, 1] = out[:, 1] * scale
         preds.append(out.cpu().numpy())
+        if peaks_all is not None and det is not None:
+            prob = torch.sigmoid(det).cpu()
+            for pk in heat_to_peaks(prob):
+                if det_scale != 1.0:
+                    pk = [(cl, x * det_scale, y * det_scale, s)
+                          for (cl, x, y, s) in pk]
+                peaks_all.append(pk)
     pred = np.concatenate(preds, axis=0)
-    return metrics(pred, lab)
+    m = metrics(pred, lab)
+    if peaks_all is not None and det_gt is not None:
+        m.update(det_metrics(peaks_all, det_gt, tol_px=scale * 8.0))
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -371,9 +535,19 @@ def parse_args() -> argparse.Namespace:
                    help="max ROI side (px); use <= the native data size, e.g. "
                         "--roi-min 96 --roi-max 512 for 512px data (content "
                         "scale ~64..512px after predict normalisation)")
+    p.add_argument("--det-w", type=float, default=0.5,
+                   help="weight of the transient heatmap loss (0 disables "
+                        "detection training even if the data has GT)")
     p.add_argument("--max-train", type=int, default=0,
                    help="cap the number of train samples actually used "
                         "(0 = all); handy to smoke-test on a huge dataset")
+    p.add_argument("--resume", type=Path, default=None,
+                   help="state dict / checkpoint to initialise the model from "
+                        "(two-stage: train pose first, then resume with "
+                        "--det-w and a low --lr to tune detection)")
+    p.add_argument("--freeze-pose", action="store_true",
+                   help="freeze every parameter except the detection head "
+                        "(resume from a converged pose checkpoint)")
     return p.parse_args()
 
 
@@ -427,9 +601,73 @@ def main() -> None:
     zero = np.zeros_like(lab)
     print("baseline (predict dx=dy=roll=0):", fmt(metrics(zero, lab)))
 
+    # ---- transient detection setup (native mode only) ----------------------
+    det_active = False
+    n_cls = 0
+    det_w = 0.0
+    grid = dst // DET_STRIDE
+    det_loss = None
+    val_det_gt = None
+    val_det_targets = None
+    test_det_gt = None
+    test_det_targets = None
+    tr_tn = tr_tx = tr_ty = tr_tc = None
+
+    if (args.det_w > 0 and not roi_active and args.crop <= 0
+            and (args.data / "train_meta.npz").exists()):
+        zt = np.load(args.data / "train_meta.npz")
+        if "trans_n" in zt.files:
+            det_active = True
+            n_cls = 3
+            det_w = float(args.det_w)
+            tr_tn = np.asarray(zt["trans_n"])
+            tr_tx = np.asarray(zt["trans_x"])
+            tr_ty = np.asarray(zt["trans_y"])
+            tr_tc = np.asarray(zt["trans_cls"])
+            det_loss = TransientHeatLoss()
+
+            def _load_trans_gt(path: Path, nn: int):
+                zp = np.load(path)
+                arr = {"trans_n": np.asarray(zp["trans_n"]),
+                       "trans_x": np.asarray(zp["trans_x"]),
+                       "trans_y": np.asarray(zp["trans_y"]),
+                       "trans_cls": np.asarray(zp["trans_cls"])}
+                tgt = build_heat_targets(arr, nn, grid)
+                gt = []
+                for i in range(nn):
+                    row = []
+                    for j in range(int(arr["trans_n"][i])):
+                        row.append((float(arr["trans_x"][i, j]),
+                                    float(arr["trans_y"][i, j]),
+                                    int(round(float(arr["trans_cls"][i, j])))))
+                    gt.append(row)
+                return tgt, gt
+
+            val_det_targets, val_det_gt = _load_trans_gt(
+                args.data / "val_meta.npz", len(va_y))
+            test_det_targets, test_det_gt = _load_trans_gt(
+                args.data / "test_meta.npz", len(te_y))
+    if det_active:
+        print(f"transient detection on: {n_cls} classes, heat grid {grid}")
+
     crop = args.crop if 0 < args.crop < dst else None
-    model = PairRegNet().to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    model = PairRegNet(n_cls=n_cls).to(device)
+    if args.resume is not None:
+        robj = torch.load(args.resume, map_location=device)
+        rsd = robj["model"] if isinstance(robj, dict) and "model" in robj else robj
+        # lenient: allows resuming a pose-only checkpoint into a detection run
+        # (detection weights stay random) or architecture evolution of det.
+        missing, unexpected = model.load_state_dict(rsd, strict=False)
+        print(f"resumed from {args.resume}  (missing {len(missing)} tensors, "
+              f"unused {len(unexpected)})")
+    if args.freeze_pose:
+        for name, param in model.named_parameters():
+            param.requires_grad = name.startswith("det.")
+        nf = sum(1 for p in model.parameters() if not p.requires_grad)
+        print(f"froze {nf} parameter tensors outside the detection head")
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     best = None
 
@@ -438,35 +676,60 @@ def main() -> None:
         t_ep = time.perf_counter()
         order = np.random.permutation(n)
         tot_loss = 0.0
+        tot_reg = 0.0
+        tot_det = 0.0
         nb = 0
         for i in range(0, n, args.batch):
             idx = order[i : i + args.batch]
             pb = torch.from_numpy(fetch_norm_batch(tr_a, tr_b, tr_norm, idx))
             yb = train_ys[torch.from_numpy(np.asarray(idx, dtype=np.int64))].clone()
-            pairs, ys = [], []
+            hb_raw = None
+            if det_active:
+                hb_raw = build_heat_targets(
+                    {"trans_n": tr_tn[idx], "trans_x": tr_tx[idx],
+                     "trans_y": tr_ty[idx], "trans_cls": tr_tc[idx]},
+                    len(idx), grid)
+            pairs, ys, hmaps = [], [], []
             for j in range(len(pb)):
                 p, y = pb[j], yb[j]
+                hj = hb_raw[j] if hb_raw is not None else None
                 if roi_active:
                     p, y = roisample_pair(p, y, src, dst,
                                           args.roi_min, min(args.roi_max, src))
-                p, y = augment_pair(p, y, crop=crop, p_crop=1.0 if crop else 0.0)
+                out3 = augment_pair(p, y, crop=crop,
+                                    p_crop=1.0 if crop else 0.0, hmap=hj)
+                if hj is not None:
+                    p, y, hj = out3
+                    hmaps.append(hj)
+                else:
+                    p, y = out3
                 pairs.append(p)
                 ys.append(y)
             pb = torch.stack(pairs).to(device)
             yb = torch.stack(ys).to(device)
             opt.zero_grad()
-            out = model(pb)
-            loss = regression_loss(out, yb)
+            pose, det = model(pb)
+            rloss = regression_loss(pose, yb)
+            loss = rloss
+            dl = None
+            if det_active and det is not None:
+                dl = det_loss(det, torch.stack(hmaps).to(device))
+                loss = loss + det_w * dl
             loss.backward()
             opt.step()
             tot_loss += float(loss) * len(pb)
+            tot_reg += float(rloss) * len(pb)
+            if dl is not None:
+                tot_det += float(dl) * len(pb)
             nb += len(pb)
         sched.step()
-        vm = evaluate(model, val_pairs, va_y, device, args.batch, scale=metric_scale)
+        vm = evaluate(model, val_pairs, va_y, device, args.batch,
+                      scale=metric_scale, det_gt=val_det_gt if det_active else None)
+        det_str = fmt_det(vm) if det_active else ""
         print(
             f"ep {ep + 1:02d}/{args.epochs}  loss {tot_loss / nb:.4f}  "
             f"lr {sched.get_last_lr()[0]:.1e}  ({time.perf_counter() - t_ep:.0f}s)  "
-            f"val: {fmt(vm)}"
+            f"val: {fmt(vm)}  {det_str}"
         )
         score = vm["med_mag"] + 0.25 * vm["med_roll"]
         if best is None or score < best[0]:
@@ -483,12 +746,20 @@ def main() -> None:
     if best is None:
         raise RuntimeError("no epoch ran")
     _, ep_best, vm_best = best
-    print(f"\nbest val at epoch {ep_best + 1}: {fmt(vm_best)}")
+    print(f"\nbest val at epoch {ep_best + 1}: {fmt(vm_best)}"
+          + (f"  {fmt_det(vm_best)}" if det_active else ""))
 
     model.load_state_dict(torch.load(args.model_dir / "best.pt"))
-    for split, pairs, lab in (("val", val_pairs, va_y), ("test", test_pairs, te_y)):
-        m = evaluate(model, pairs, lab, device, args.batch, scale=metric_scale)
-        print(f"{split} final: {fmt(m)}")
+    for split, pairs, labn, dgt in (
+        ("val", val_pairs, va_y, val_det_gt if det_active else None),
+        ("test", test_pairs, te_y, test_det_gt if det_active else None),
+    ):
+        m = evaluate(model, pairs, labn, device, args.batch, scale=metric_scale,
+                     det_gt=dgt)
+        line = f"{split} final: {fmt(m)}"
+        if dgt is not None:
+            line += f"  {fmt_det(m)}"
+        print(line)
 
     with (args.model_dir / "train_summary.json").open("w") as f:
         json.dump(
@@ -498,6 +769,8 @@ def main() -> None:
                 "model_in": dst,
                 "native": src,
                 "metric_scale": metric_scale,
+                "det_classes": n_cls,
+                "det_weight": det_w,
                 "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             },
             f,

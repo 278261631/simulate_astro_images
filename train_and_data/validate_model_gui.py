@@ -74,7 +74,13 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from model import PairRegNet, decode, preprocess  # noqa: E402
+from model import (  # noqa: E402
+    PairRegNet,
+    build_model_from_state,
+    decode,
+    heat_to_peaks,
+    preprocess,
+)
 
 DEFAULT_MODEL = HERE / "models" / "best.pt"
 DEFAULT_DATA = HERE / "data_smoke"
@@ -147,9 +153,7 @@ def load_checkpoint(path: Path) -> tuple[PairRegNet, dict | None, int]:
     else:
         sd = obj
         info = None
-    net = PairRegNet()
-    net.load_state_dict(sd)
-    net.eval()
+    net = build_model_from_state(sd)
     return net, info, resolve_model_size(path, obj)
 
 
@@ -167,9 +171,11 @@ class SplitData:
     sample.
     """
 
-    def __init__(self, a, b, labels: np.ndarray, meta_rows: list[dict | None]) -> None:
+    def __init__(self, a, b, labels: np.ndarray, meta_rows: list[dict | None],
+                 trans: dict | None = None) -> None:
         self.labels = np.asarray(labels, dtype=np.float64)
         self.meta_rows = meta_rows
+        self.trans = trans  # optional {'trans_n','trans_x','trans_y','trans_cls'}
         self.n = len(self.labels)
         if isinstance(a, np.ndarray):
             self.a = a
@@ -191,6 +197,18 @@ class SplitData:
     def meta(self, i: int) -> dict:
         row = self.meta_rows[i]
         return dict(row) if row else {}
+
+    def det_gt(self, i: int) -> list[tuple[float, float, int]]:
+        """Ground-truth transients for sample i as (x, y, cls) in B-frame px."""
+        if self.trans is None or "trans_n" not in self.trans:
+            return []
+        n = int(self.trans["trans_n"][i])
+        out = []
+        for j in range(n):
+            out.append((float(self.trans["trans_x"][i, j]),
+                        float(self.trans["trans_y"][i, j]),
+                        int(round(float(self.trans["trans_cls"][i, j])))))
+        return out
 
 
 def _numpy_meta_rows(n: int, npz: dict) -> list[dict]:
@@ -215,10 +233,17 @@ def load_numpy_split(data_dir: Path, split: str) -> SplitData:
     b = np.load(data_dir / f"{split}_b.npy")
     lab = np.load(data_dir / f"{split}_labels.npy")
     meta = {}
+    trans = None
     meta_path = data_dir / f"{split}_meta.npz"
     if meta_path.exists():
-        meta = {k: np.load(meta_path)[k] for k in np.load(meta_path).files}
-    return SplitData(a, b, lab, _numpy_meta_rows(len(a), meta))
+        mz = np.load(meta_path)
+        meta = {k: mz[k] for k in mz.files}
+        if "trans_n" in mz.files:
+            trans = {"trans_n": np.asarray(mz["trans_n"]),
+                     "trans_x": np.asarray(mz["trans_x"]),
+                     "trans_y": np.asarray(mz["trans_y"]),
+                     "trans_cls": np.asarray(mz["trans_cls"])}
+    return SplitData(a, b, lab, _numpy_meta_rows(len(a), meta), trans=trans)
 
 
 _TXT_LABEL_RE = re.compile(
@@ -385,6 +410,67 @@ def to_pixmap(arr, max_side: int) -> QPixmap:
     return pm.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
+_DET_COLORS = {0: (255, 40, 40), 1: (255, 170, 40), 2: (200, 60, 255)}
+
+
+def annotate_markers(u8: np.ndarray, pts, use_class: bool = True,
+                     style: str = "cross") -> np.ndarray:
+    """Return an RGB copy of the grayscale frame with markers on ``pts``.
+
+    ``pts``: list of (x, y[, cls]). Colour encodes the class. ``style``:
+    'cross' for predictions, 'ring' for ground truth (square outline).
+    """
+    h, w = u8.shape[:2]
+    if u8.ndim == 3:
+        out = u8.copy()
+    else:
+        out = np.dstack([u8, u8, u8]).astype(np.uint8)
+    for pt in pts:
+        x, y = float(pt[0]), float(pt[1])
+        cl = int(round(float(pt[2]))) if use_class and len(pt) > 2 else 0
+        c = _DET_COLORS.get(cl, (255, 255, 255))
+        xi, yi = int(round(x)), int(round(y))
+        r = max(2, int(round(h * 0.012)))
+        if style == "ring":
+            cells = [(xi + a, yi + b) for a in range(-r, r + 1)
+                     for b in range(-r, r + 1)
+                     if max(abs(a), abs(b)) == r]
+        else:  # cross + centre block
+            cells = [(xi + dx, yi + dy) for dx in (-r, 0, r)
+                     for dy in (-r, 0, r)]
+        for xx, yy in cells:
+            if 0 <= yy < h and 0 <= xx < w:
+                out[yy, xx, 0], out[yy, xx, 1], out[yy, xx, 2] = c
+    return out
+
+
+def det_summary(records: list[dict], src: "SplitData", tol_px: float = 8.0) -> dict:
+    """Aggregate transient detection P/R against split GT (native B-frame px)."""
+    tp = fp = fn = 0
+    for i, r in enumerate(records):
+        gts = src.det_gt(i)
+        used = set()
+        for (cl, x, y, s) in r["det"]:
+            best = None
+            for gi, (gx, gy, gcl) in enumerate(gts):
+                if gi in used or gcl != cl:
+                    continue
+                d = math.hypot(x - gx, y - gy)
+                if d <= tol_px and (best is None or d < best[0]):
+                    best = (d, gi)
+            if best is not None:
+                tp += 1
+                used.add(best[1])
+            else:
+                fp += 1
+        fn += len(gts) - len(used)
+    prec = tp / max(1e-9, tp + fp)
+    rec = tp / max(1e-9, tp + fn)
+    return {"prec": prec, "rec": rec,
+            "f1": 2 * prec * rec / max(1e-9, prec + rec),
+            "tp": tp, "fp": fp, "fn": fn}
+
+
 # ---------------------------------------------------------------------------
 # Background evaluation worker
 # ---------------------------------------------------------------------------
@@ -418,13 +504,20 @@ class EvalWorker(QThread):
                 pairs.append(preprocess(ia, ib))
             pairs = torch.stack(pairs)
             pred = np.zeros((n, 3), dtype=np.float64)
+            det_pred = [[] for _ in range(n)]
             with torch.no_grad():
                 for st in range(0, n, self.batch):
                     if self.isInterruptionRequested():
                         return
                     en = min(st + self.batch, n)
-                    out = decode(self.net(pairs[st:en])).numpy()
+                    pose, det = self.net(pairs[st:en])
+                    out = decode(pose).numpy()
                     pred[st:en] = out
+                    if det is not None:
+                        for k, pk in enumerate(heat_to_peaks(torch.sigmoid(det))):
+                            pk = [(cl, x / scales[st + k], y / scales[st + k], s)
+                                  for (cl, x, y, s) in pk]
+                            det_pred[st + k] = pk
                     self.progress.emit(en, n)
             # convert model-grid offsets back to the dataset's pixel scale
             pred[:, 0] /= scales
@@ -447,6 +540,7 @@ class EvalWorker(QThread):
                         "err_dy": float(e[1]),
                         "err_roll": float(((e[2] + 180.0) % 360.0) - 180.0),
                         "mag": float(math.hypot(e[0], e[1])),
+                        "det": det_pred[i],
                         "elapsed": time.perf_counter() - t0,
                     }
                 )
@@ -471,6 +565,7 @@ class ValidatorWindow(QMainWindow):
         self.records: list[dict] = []
         self.worker: EvalWorker | None = None
         self.model_size: int = DEFAULT_MODEL_SIZE
+        self.has_det: bool = False
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -605,6 +700,7 @@ class ValidatorWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "model", f"failed to load {path.name}:\n{exc}")
             return
+        self.has_det = self.net.det is not None
         n_params = sum(p.numel() for p in self.net.parameters())
         extra = ""
         if info is not None:
@@ -682,6 +778,13 @@ class ValidatorWindow(QMainWindow):
                 mask = sizes == z
                 mz = error_metrics(pred[mask], lab[mask])
                 lines.append(f"  {int(z)}px x {int(mask.sum()):<3}: {fmt_metrics(mz)}")
+        # transient detection aggregate (numpy datasets carrying GT)
+        if (self.src is not None and self.src.trans is not None
+                and self.has_det):
+            ds = det_summary(records, self.src)
+            lines.append(
+                f"detect: P {ds['prec']:.2f}  R {ds['rec']:.2f}  F1 {ds['f1']:.2f}"
+                f"   tp {ds['tp']} fp {ds['fp']} fn {ds['fn']}")
         self.lbl_summary.setText("\n".join(lines))
         self.status.setText("done")
 
@@ -743,8 +846,17 @@ class ValidatorWindow(QMainWindow):
         b = display_stretch(ib)
         gt_b = warp_b_onto_a(b, r["gt_dx"], r["gt_dy"], r["gt_roll"])
         pr_b = warp_b_onto_a(b, r["dx"], r["dy"], r["roll"])
+        # transient markers: GT rings + predicted crosses, both in B-frame px
+        b_show = b
+        if self.src.trans is not None or r.get("det"):
+            gt_pts = self.src.det_gt(idx)
+            pred_pts = [(p[1], p[2], p[0]) for p in r.get("det", [])]
+            if gt_pts:
+                b_show = annotate_markers(b_show, gt_pts, style="ring")
+            if pred_pts:
+                b_show = annotate_markers(b_show, pred_pts, style="cross")
         self._panes["A"].setPixmap(to_pixmap(a, 420))
-        self._panes["B"].setPixmap(to_pixmap(b, 420))
+        self._panes["B"].setPixmap(to_pixmap(b_show, 420))
         self._panes["B aligned to A  (ground truth)"].setPixmap(
             to_pixmap(blend_ab(a, gt_b), 420))
         self._panes["B aligned to A  (prediction)"].setPixmap(

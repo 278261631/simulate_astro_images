@@ -23,7 +23,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from model import PairRegNet, decode, preprocess  # noqa: E402
+from model import (  # noqa: E402
+    PairRegNet,
+    build_model_from_state,
+    decode,
+    heat_to_peaks,
+    preprocess,
+)
 
 DEFAULT_MODEL_SIZE = 192  # fallback when no metadata is found
 
@@ -75,12 +81,12 @@ def main() -> None:
     if args.a is None or args.b is None:
         p.error("provide --checkpoint model and two image paths")
 
-    model = PairRegNet()
     obj = torch.load(args.checkpoint, map_location="cpu")
     if isinstance(obj, dict) and "model" in obj:
-        model.load_state_dict(obj["model"])
+        sd = obj["model"]
     else:
-        model.load_state_dict(obj)
+        sd = obj
+    model = build_model_from_state(sd)
     model_size = resolve_model_size(args.checkpoint, obj)
     model.eval()
 
@@ -106,11 +112,22 @@ def main() -> None:
 
     pair = preprocess(ia, ib).unsqueeze(0)  # (1, 2, H, W)
     with torch.no_grad():
-        dx, dy, roll = decode(model(pair))[0].tolist()
+        pose, det = model(pair)
+        dx, dy, roll = decode(pose)[0].tolist()
+        peaks = heat_to_peaks(torch.sigmoid(det))[0] if det is not None else []
     dx /= s
     dy /= s
     print(f"A center in B frame:  dx {dx:+.2f} px   dy {dy:+.2f} px   droll {roll:+.2f}\u00b0")
     print(f"shift B by {dx:+.2f}, {dy:+.2f} px and {-roll:+.2f}\u00b0 to align B onto A")
+    cls_names = ("new", "brighten", "move")
+    if peaks:
+        print("transient candidates in B frame (native px):")
+        for cl, x, y, sc in peaks:
+            x /= s
+            y /= s
+            print(f"  {cls_names[cl]:>8}  x {x:7.1f}  y {y:7.1f}  score {sc:.2f}")
+    elif det is not None:
+        print("transient candidates: none above threshold")
 
 
 if __name__ == "__main__":
