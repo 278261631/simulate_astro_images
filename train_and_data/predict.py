@@ -25,7 +25,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model import PairRegNet, decode, preprocess  # noqa: E402
 
-MODEL_SIZE = 192
+DEFAULT_MODEL_SIZE = 192  # fallback when no metadata is found
+
+
+def resolve_model_size(path: Path, obj) -> int:
+    """Pixel size of the model input grid for a checkpoint.
+
+    Priority: full checkpoint dict (``model_in`` written by train.py) ->
+    sibling ``best_info.json`` sidecar -> legacy 192.
+    """
+    if isinstance(obj, dict) and isinstance(obj.get("model_in"), int):
+        return int(obj["model_in"])
+    side = Path(path).with_name("best_info.json")
+    if side.exists():
+        try:
+            import json
+            return int(json.loads(side.read_text(encoding="utf-8"))["model_in"])
+        except Exception:
+            pass
+    return DEFAULT_MODEL_SIZE
 
 
 def load_gray(path: Path) -> np.ndarray:
@@ -58,7 +76,12 @@ def main() -> None:
         p.error("provide --checkpoint model and two image paths")
 
     model = PairRegNet()
-    model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    obj = torch.load(args.checkpoint, map_location="cpu")
+    if isinstance(obj, dict) and "model" in obj:
+        model.load_state_dict(obj["model"])
+    else:
+        model.load_state_dict(obj)
+    model_size = resolve_model_size(args.checkpoint, obj)
     model.eval()
 
     ia = load_gray(args.a)
@@ -70,13 +93,13 @@ def main() -> None:
     import cv2
 
     h, w = ia.shape
-    s = MODEL_SIZE / max(w, h)  # scale so max side == model size
+    s = model_size / max(w, h)  # scale so max side == model size
     new_w, new_h = max(1, int(round(w * s))), max(1, int(round(h * s)))
     if (new_w, new_h) != (w, h):
         ia = cv2.resize(ia, (new_w, new_h), interpolation=cv2.INTER_AREA)
         ib = cv2.resize(ib, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    # pad to square MODEL_SIZE
-    ph, pw = MODEL_SIZE - ia.shape[0], MODEL_SIZE - ia.shape[1]
+    # pad to square model_size
+    ph, pw = model_size - ia.shape[0], model_size - ia.shape[1]
     pad = ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2))
     ia = np.pad(ia, pad, mode="edge")
     ib = np.pad(ib, pad, mode="edge")

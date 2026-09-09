@@ -15,10 +15,14 @@ Workflow
 
 2. Pick a split (train / val / test) and press *Run split*. Every pair is
    scored in a background thread and an error table + summary metrics are
-   shown (same statistics ``train.py`` prints).  Images smaller than the
-   model's native 192 px (e.g. the 96 px smoke set) are resampled to 192 px
-   for inference; predicted pixel offsets are scaled back to the original
-   image scale so the GT comparison stays in the dataset's pixels.
+   shown (same statistics ``train.py`` prints).  Frames of any size (and
+   mixed sizes within one split, e.g. the default multi-resolution smoke set)
+   are resampled to the model's native resolution (read from the checkpoint,
+   fallback 192 px) for inference; predicted pixel
+   offsets are scaled back to the original image scale so the GT comparison
+   stays in the dataset's pixels.  When sizes are mixed the summary also
+   lists one metric line per resolution, and the table's *px* column sorts
+   them.
 
 3. Click a table row to inspect that pair:
        A             frame A, display stretched
@@ -74,7 +78,25 @@ from model import PairRegNet, decode, preprocess  # noqa: E402
 
 DEFAULT_MODEL = HERE / "models" / "best.pt"
 DEFAULT_DATA = HERE / "data_smoke"
-MODEL_SIZE = 192  # pixel size the network was trained on
+DEFAULT_MODEL_SIZE = 192  # pixel size fallback when the checkpoint has no metadata
+
+
+def resolve_model_size(path: Path, obj) -> int:
+    """Pixel size of the model input grid for a checkpoint.
+
+    Priority: full checkpoint dict (``model_in`` written by train.py) ->
+    sibling ``best_info.json`` sidecar -> legacy 192.
+    """
+    if isinstance(obj, dict) and isinstance(obj.get("model_in"), int):
+        return int(obj["model_in"])
+    side = Path(path).with_name("best_info.json")
+    if side.exists():
+        try:
+            import json
+            return int(json.loads(side.read_text(encoding="utf-8"))["model_in"])
+        except Exception:
+            pass
+    return DEFAULT_MODEL_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +138,8 @@ def display_stretch(u8: np.ndarray) -> np.ndarray:
     return (np.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
-def load_checkpoint(path: Path) -> tuple[PairRegNet, dict | None]:
-    """Load either a raw state dict or the full checkpoint dict train.py writes."""
+def load_checkpoint(path: Path) -> tuple[PairRegNet, dict | None, int]:
+    """Load a state dict / full checkpoint; return (net, info, model_input_size)."""
     obj = torch.load(path, map_location="cpu")
     if isinstance(obj, dict) and "model" in obj:
         sd = obj["model"]
@@ -128,7 +150,7 @@ def load_checkpoint(path: Path) -> tuple[PairRegNet, dict | None]:
     net = PairRegNet()
     net.load_state_dict(sd)
     net.eval()
-    return net, info
+    return net, info, resolve_model_size(path, obj)
 
 
 # ---------------------------------------------------------------------------
@@ -137,19 +159,31 @@ def load_checkpoint(path: Path) -> tuple[PairRegNet, dict | None]:
 
 
 class SplitData:
-    """Uniform handle over a split, whichever layout produced it."""
+    """Uniform handle over a split, whichever layout produced it.
 
-    def __init__(self, a: np.ndarray, b: np.ndarray, labels: np.ndarray,
-                 meta_rows: list[dict | None]) -> None:
-        self.a = a
-        self.b = b
+    ``a``/``b`` are either a single (n, H, W) uint8 array (numpy layout,
+    uniform resolution) or a sequence of per-sample (H, W) arrays (image/text
+    layout, which may mix resolutions). ``sizes`` always holds one entry per
+    sample.
+    """
+
+    def __init__(self, a, b, labels: np.ndarray, meta_rows: list[dict | None]) -> None:
         self.labels = np.asarray(labels, dtype=np.float64)
         self.meta_rows = meta_rows
-        self.n = len(a)
+        self.n = len(self.labels)
+        if isinstance(a, np.ndarray):
+            self.a = a
+            self.b = b
+            sizes = np.full(self.n, int(a.shape[1]), dtype=int)
+        else:
+            self.a = [np.asarray(x, dtype=np.uint8) for x in a]
+            self.b = [np.asarray(x, dtype=np.uint8) for x in b]
+            sizes = np.asarray([x.shape[0] for x in self.a], dtype=int)
+        self.sizes = np.asarray(sizes)
 
     @property
-    def size(self) -> int:
-        return self.a.shape[1]
+    def uniform_size(self) -> int | None:
+        return int(self.sizes[0]) if (self.sizes == self.sizes[0]).all() else None
 
     def images(self, i: int) -> tuple[np.ndarray, np.ndarray]:
         return self.a[i], self.b[i]
@@ -258,9 +292,10 @@ def load_image_split(split_dir: Path) -> SplitData:
     if not arrays_a:
         raise FileNotFoundError(f"no complete A/B/TXT pairs in {split_dir}")
     order = np.argsort(idxs)
-    a = np.stack([arrays_a[i] for i in order])
-    b = np.stack([arrays_b[i] for i in order])
-    labels = np.asarray([labels[i] for i in order], dtype=np.float64)
+    # kept as a list: --smoke-sizes may mix several frame resolutions in one split
+    a = [arrays_a[i] for i in order]
+    b = [arrays_b[i] for i in order]
+    labels = [labels[i] for i in order]
     meta_rows = [meta_rows[i] for i in order]
     return SplitData(a, b, labels, meta_rows)
 
@@ -283,22 +318,22 @@ def load_split(data_dir: Path, split: str) -> SplitData:
 
 
 # ---------------------------------------------------------------------------
-# Inference pre-processing (resample any size to the model's 192 px grid)
+# Inference pre-processing (resample any size to the model's pixel grid)
 # ---------------------------------------------------------------------------
 
 
-def _to_model_scale(ia: np.ndarray, ib: np.ndarray):
-    """Return (ia, ib resized to MODEL_SIZE, px_scale).  px_scale = model px
+def _to_model_scale(ia: np.ndarray, ib: np.ndarray, model_size: int):
+    """Return (ia, ib resized to model_size, px_scale).  px_scale = model px
     per original px; predicted offsets in the original grid = prediction / it."""
     import cv2  # noqa: PLC0415 - heavy import, kept local like predict.py
 
     h, w = ia.shape
-    s = MODEL_SIZE / max(w, h)
+    s = model_size / max(w, h)
     nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
     if (nw, nh) != (w, h):
         ia = cv2.resize(ia, (nw, nh), interpolation=cv2.INTER_AREA)
         ib = cv2.resize(ib, (nw, nh), interpolation=cv2.INTER_AREA)
-    ph, pw = MODEL_SIZE - nh, MODEL_SIZE - nw
+    ph, pw = model_size - nh, model_size - nw
     pad = ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2))
     ia = np.pad(ia, pad, mode="edge")
     ib = np.pad(ib, pad, mode="edge")
@@ -360,11 +395,12 @@ class EvalWorker(QThread):
     done = Signal(object)                # list[dict] per-sample records
     failed = Signal(str)
 
-    def __init__(self, net: PairRegNet, src: SplitData, batch: int = 64,
-                 parent=None) -> None:
+    def __init__(self, net: PairRegNet, src: SplitData, model_size: int,
+                 batch: int = 64, parent=None) -> None:
         super().__init__(parent)
         self.net = net
         self.src = src
+        self.model_size = model_size
         self.batch = batch
 
     def run(self) -> None:
@@ -372,11 +408,12 @@ class EvalWorker(QThread):
             t0 = time.perf_counter()
             src = self.src
             n = len(src.labels)
+            ms = self.model_size
             pairs = []
             scales = np.ones(n)
             for i in range(n):
                 ia, ib = src.images(i)
-                ia, ib, s = _to_model_scale(ia, ib)
+                ia, ib, s = _to_model_scale(ia, ib, ms)
                 scales[i] = s
                 pairs.append(preprocess(ia, ib))
             pairs = torch.stack(pairs)
@@ -399,6 +436,7 @@ class EvalWorker(QThread):
                 records.append(
                     {
                         "i": int(i),
+                        "size": int(src.sizes[i]),
                         "gt_dx": float(gt[i, 0]),
                         "gt_dy": float(gt[i, 1]),
                         "gt_roll": float(gt[i, 2]),
@@ -432,6 +470,7 @@ class ValidatorWindow(QMainWindow):
         self.src: SplitData | None = None
         self.records: list[dict] = []
         self.worker: EvalWorker | None = None
+        self.model_size: int = DEFAULT_MODEL_SIZE
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -531,8 +570,8 @@ class ValidatorWindow(QMainWindow):
         row.addWidget(bt_sort)
         lay.addLayout(row)
 
-        cols = ["idx", "gt dx", "gt dy", "gt roll", "pred dx", "pred dy", "pred roll",
-                "err dx", "err dy", "err roll", "|shift| px"]
+        cols = ["idx", "px", "gt dx", "gt dy", "gt roll", "pred dx", "pred dy",
+                "pred roll", "err dx", "err dy", "err roll", "|shift| px"]
         self.table = QTableWidget(0, len(cols))
         self.table.setHorizontalHeaderLabels(cols)
         hh = self.table.horizontalHeader()
@@ -562,7 +601,7 @@ class ValidatorWindow(QMainWindow):
             QMessageBox.warning(self, "model", f"file not found:\n{path}")
             return
         try:
-            self.net, info = load_checkpoint(path)
+            self.net, info, self.model_size = load_checkpoint(path)
         except Exception as exc:
             QMessageBox.critical(self, "model", f"failed to load {path.name}:\n{exc}")
             return
@@ -573,7 +612,8 @@ class ValidatorWindow(QMainWindow):
             if m:
                 extra = f"\nembedded val metrics from training: {fmt_metrics(m)}"
         self.status.setText(
-            f"loaded {path.name} ({n_params / 1e6:.1f}M params){extra}")
+            f"loaded {path.name} ({n_params / 1e6:.1f}M params, "
+            f"model input {self.model_size}px){extra}")
         self._refresh_controls()
 
     def _run_split(self) -> None:
@@ -594,15 +634,18 @@ class ValidatorWindow(QMainWindow):
             return
 
         src = self.src
+        sz = src.uniform_size
+        sdesc = f"{sz} px" if sz is not None else \
+            f"{int(src.sizes.min())}-{int(src.sizes.max())} px (mixed)"
         self.status.setText(
-            f"evaluating {split} split: {src.n} pairs, size {src.size} px "
+            f"evaluating {split} split: {src.n} pairs, {sdesc} "
             f"({data_dir}) \u2026")
         self.progress.setRange(0, src.n)
         self.progress.setValue(0)
         self.bt_run.setEnabled(False)
         self._clear_table()
 
-        self.worker = EvalWorker(self.net, src, parent=self)
+        self.worker = EvalWorker(self.net, src, self.model_size, parent=self)
         self.worker.progress.connect(lambda cur, tot: self.progress.setValue(cur))
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
@@ -621,13 +664,25 @@ class ValidatorWindow(QMainWindow):
         zero = np.zeros_like(lab)
         base = error_metrics(zero, lab)
         el = records[0]["elapsed"]
-        scale_note = ""
-        if self.src is not None and self.src.size != MODEL_SIZE:
-            scale_note = f"\n{self.src.size}px frames resampled to {MODEL_SIZE}px for inference"
-        self.lbl_summary.setText(
-            f"{self.cmb_split.currentText()}  {n} pairs  ({el:.1f}s){scale_note}\n"
-            f"baseline (predict zeros): {fmt_metrics(base)}\n"
-            f"model:                    {fmt_metrics(m)}")
+        lines = [f"{self.cmb_split.currentText()}  {n} pairs  ({el:.1f}s)"]
+        ms = self.model_size
+        if self.src is not None:
+            sz = self.src.uniform_size
+            if sz is None:
+                lines[0] += (f"\n{sorted(set(self.src.sizes.tolist()))} px mixed; "
+                             f"every frame resampled to {ms}px for inference")
+            elif sz != ms:
+                lines[0] += f"\n{sz}px frames resampled to {ms}px for inference"
+        lines.append(f"baseline (predict zeros): {fmt_metrics(base)}")
+        lines.append(f"model:                    {fmt_metrics(m)}")
+        # per-resolution breakdown when sizes are mixed
+        if self.src is not None and self.src.uniform_size is None:
+            sizes = np.asarray([r["size"] for r in records])
+            for z in np.unique(sizes):
+                mask = sizes == z
+                mz = error_metrics(pred[mask], lab[mask])
+                lines.append(f"  {int(z)}px x {int(mask.sum()):<3}: {fmt_metrics(mz)}")
+        self.lbl_summary.setText("\n".join(lines))
         self.status.setText("done")
 
     def _on_failed(self, msg: str) -> None:
@@ -641,6 +696,7 @@ class ValidatorWindow(QMainWindow):
         for row, r in enumerate(records):
             vals = [
                 f"{r['i']}",
+                f"{r['size']}",
                 f"{r['gt_dx']:+.2f}", f"{r['gt_dy']:+.2f}", f"{r['gt_roll']:+.2f}",
                 f"{r['dx']:+.2f}", f"{r['dy']:+.2f}", f"{r['roll']:+.2f}",
                 f"{r['err_dx']:+.2f}", f"{r['err_dy']:+.2f}", f"{r['err_roll']:+.2f}",

@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -77,6 +78,58 @@ def to_pair_tensor(a_u8: np.ndarray, b_u8: np.ndarray) -> torch.Tensor:
     return torch.stack(pre)
 
 
+def resize_pair_tensor(pair: torch.Tensor, dst: int) -> torch.Tensor:
+    """(..., 2, H, W) -> (..., 2, dst, dst) via area-ish bilinear resize.
+
+    ``antialias`` is used when available (avoids moire/aliasing when
+    down-sampling noisy frames); silently falls back otherwise.
+    """
+    if pair.shape[-1] == dst and pair.shape[-2] == dst:
+        return pair
+    try:
+        return F.interpolate(pair, size=(dst, dst), mode="bilinear",
+                             align_corners=False, antialias=True)
+    except TypeError:  # pragma: no cover - older torch without antialias
+        return F.interpolate(pair, size=(dst, dst), mode="bilinear",
+                             align_corners=False)
+
+
+def to_pair_tensor_resized(a_u8: np.ndarray, b_u8: np.ndarray, dst: int) -> torch.Tensor:
+    """Percentile-normalise (like preprocess), then full-frame resize to ``dst``.
+
+    This is the deterministic counterpart of the training-time ROI sampling with
+    c == src: the label stays in original pixels and ``evaluate`` converts the
+    prediction back via ``scale = src / dst``.
+    """
+    pair = to_pair_tensor(a_u8, b_u8)          # (N, 2, src, src)
+    return resize_pair_tensor(pair, dst)
+
+
+def roisample_pair(pair: torch.Tensor, y: torch.Tensor, src: int, dst: int,
+                   cmin: int, cmax: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random-resolution ROI augmentation on a (2, src, src) float pair.
+
+    Samples a square ROI of side ``c`` at a random location (identical for A
+    and B, so it is a pure translation + scale: droll unchanged) and resizes it
+    back to ``dst``. Because content is magnified by ``ke = dst / c``, the
+    pixel-space offset dx/dy scales by ``ke``; cos/sin of the roll do not.
+
+    With a 512px source and dst=192 this covers c in [96, 512] ->
+    content-scale factors in [0.375, 2], i.e. deployment inputs between roughly
+    64px and 512px after predict-style normalisation.
+    """
+    c = int(np.random.randint(cmin, min(cmax, src) + 1))
+    y0 = int(np.random.randint(0, src - c + 1))
+    x0 = int(np.random.randint(0, src - c + 1))
+    roi = pair[:, y0 : y0 + c, x0 : x0 + c].unsqueeze(0)   # (1, 2, c, c)
+    pair = resize_pair_tensor(roi, dst)[0]
+    ke = dst / c
+    y = y.clone()
+    y[0] = y[0] * ke
+    y[1] = y[1] * ke
+    return pair, y
+
+
 def frame_stretch_constants(imgs, n: int) -> tuple[np.ndarray, np.ndarray]:
     """Per-frame (1.0, 99.5) percentile -> (lo, span) (n,) float32 each.
 
@@ -99,9 +152,14 @@ def frame_stretch_constants(imgs, n: int) -> tuple[np.ndarray, np.ndarray]:
     return lo, span
 
 
-def split_norm(data_dir: Path, split: str, a, b, n: int):
-    """(lo_a, span_a, lo_b, span_b) for ``split``; cached to disk per (split, n)."""
-    cache = data_dir / f"{split}_norm_{n}.npz"
+def split_norm(data_dir: Path, split: str, a, b, n: int, src: int = 0):
+    """(lo_a, span_a, lo_b, span_b) for ``split``; cached per (split, n, src).
+
+    ``src`` is baked into the cache filename so datasets generated at different
+    resolutions never silently reuse each other's percentile constants.
+    """
+    tag = f"_s{src}" if src else ""
+    cache = data_dir / f"{split}_norm_{n}{tag}.npz"
     if cache.exists():
         z = np.load(cache)
         if len(z["lo_a"]) == n:
@@ -248,14 +306,24 @@ def fmt(m: dict) -> str:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device, batch: int) -> dict:
-    """pairs: (N,2,H,W) preprocessed; lab: (N,3) [dx, dy, droll_deg]."""
+def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device, batch: int,
+             scale: float = 1.0) -> dict:
+    """pairs: (N,2,H,W) preprocessed; lab: (N,3) [dx, dy, droll_deg].
+
+    ``scale`` converts the model's pixel predictions (valid in the *model
+    input* coordinate grid, e.g. a down-sampled 192px view) back to the
+    dataset's original pixel coordinates: multiply dx/dy by it.
+    """
     model.eval()
     preds = []
     for i in range(0, len(pairs), batch):
         pb = pairs[i : i + batch].to(device)
-        out = decode(model(pb)).cpu().numpy()
-        preds.append(out)
+        out = decode(model(pb))
+        if scale != 1.0:
+            out = out.clone()
+            out[:, 0] = out[:, 0] * scale
+            out[:, 1] = out[:, 1] * scale
+        preds.append(out.cpu().numpy())
     pred = np.concatenate(preds, axis=0)
     return metrics(pred, lab)
 
@@ -263,6 +331,25 @@ def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device, bat
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+
+def _write_best_info(model_dir: Path, dst: int, src: int, metric_scale: float,
+                     vm: dict) -> None:
+    """Sidecar JSON next to best.pt describing the model's input grid.
+
+    ``best.pt`` is a bare state dict (no metadata), so inference tools
+    (predict.py / validate_model_gui.py) read this file to know the pixel size
+    the network was trained on instead of hard-coding 192.
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    with (model_dir / "best_info.json").open("w") as f:
+        json.dump(
+            {"model_in": int(dst), "native": int(src),
+             "metric_scale": float(metric_scale),
+             "best_val": vm},
+            f,
+            indent=2,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -277,6 +364,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--crop", type=int, default=0,
                    help="train on fixed-size random crops of this size "
                         "(0 = full frame)")
+    p.add_argument("--roi-min", type=int, default=0,
+                   help="random-resolution ROI augmentation: min ROI side (px); "
+                        "0 disables the augmentation")
+    p.add_argument("--roi-max", type=int, default=0,
+                   help="max ROI side (px); use <= the native data size, e.g. "
+                        "--roi-min 96 --roi-max 512 for 512px data (content "
+                        "scale ~64..512px after predict normalisation)")
     p.add_argument("--max-train", type=int, default=0,
                    help="cap the number of train samples actually used "
                         "(0 = all); handy to smoke-test on a huge dataset")
@@ -298,20 +392,34 @@ def main() -> None:
     tr_a, tr_b, tr_y = open_split_mmap(args.data, "train")
     va_a, va_b, va_y = load_split(args.data, "val")
     te_a, te_b, te_y = load_split(args.data, "test")
-    size = tr_a.shape[1]
+    src = int(tr_a.shape[1])          # native dataset resolution
     n = int(tr_a.shape[0])
     if 0 < args.max_train < n:
         n = args.max_train
         tr_a, tr_b = tr_a[:n], tr_b[:n]
         tr_y = tr_y[:n]
-    print(f"load: train {n} val {len(va_a)} test {len(te_a)}  size {size}  "
-          f"({time.perf_counter() - t0:.1f}s)")
 
-    tr_norm = split_norm(args.data, "train", tr_a, tr_b, n)
+    # Random-resolution ROI augmentation: the network always sees ``dst`` and
+    # each label is rescaled by ke = dst / c, so one model covers a wide range
+    # of deployment resolutions (predict.py normalises them to dst anyway).
+    roi_active = 0 < args.roi_min <= args.roi_max
+    if roi_active and args.roi_max > src:
+        print(f"note: roi-max {args.roi_max} > native {src}; clamping to {src}")
+    dst = 192 if (roi_active and src >= 192) else src
+    metric_scale = float(src / dst) if dst != src else 1.0
+    print(f"load: train {n} val {len(va_a)} test {len(te_a)}  "
+          f"native {src}  model-in {dst}  roi {args.roi_min}-{min(args.roi_max, src) if roi_active else 0}"
+          f"  ({time.perf_counter() - t0:.1f}s)")
+
+    tr_norm = split_norm(args.data, "train", tr_a, tr_b, n, src)
     train_ys = encode_target(tr_y)
-    val_pairs = to_pair_tensor(va_a, va_b)
+    if dst != src:
+        val_pairs = to_pair_tensor_resized(va_a, va_b, dst)
+        test_pairs = to_pair_tensor_resized(te_a, te_b, dst)
+    else:
+        val_pairs = to_pair_tensor(va_a, va_b)
+        test_pairs = to_pair_tensor(te_a, te_b)
     val_ys = encode_target(va_y)
-    test_pairs = to_pair_tensor(te_a, te_b)
     test_ys = encode_target(te_y)
     print(f"preprocess done ({time.perf_counter() - t0:.1f}s)")
 
@@ -319,7 +427,7 @@ def main() -> None:
     zero = np.zeros_like(lab)
     print("baseline (predict dx=dy=roll=0):", fmt(metrics(zero, lab)))
 
-    crop = args.crop if 0 < args.crop < size else None
+    crop = args.crop if 0 < args.crop < dst else None
     model = PairRegNet().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -337,7 +445,11 @@ def main() -> None:
             yb = train_ys[torch.from_numpy(np.asarray(idx, dtype=np.int64))].clone()
             pairs, ys = [], []
             for j in range(len(pb)):
-                p, y = augment_pair(pb[j], yb[j], crop=crop, p_crop=1.0 if crop else 0.0)
+                p, y = pb[j], yb[j]
+                if roi_active:
+                    p, y = roisample_pair(p, y, src, dst,
+                                          args.roi_min, min(args.roi_max, src))
+                p, y = augment_pair(p, y, crop=crop, p_crop=1.0 if crop else 0.0)
                 pairs.append(p)
                 ys.append(y)
             pb = torch.stack(pairs).to(device)
@@ -350,7 +462,7 @@ def main() -> None:
             tot_loss += float(loss) * len(pb)
             nb += len(pb)
         sched.step()
-        vm = evaluate(model, val_pairs, va_y, device, args.batch)
+        vm = evaluate(model, val_pairs, va_y, device, args.batch, scale=metric_scale)
         print(
             f"ep {ep + 1:02d}/{args.epochs}  loss {tot_loss / nb:.4f}  "
             f"lr {sched.get_last_lr()[0]:.1e}  ({time.perf_counter() - t_ep:.0f}s)  "
@@ -362,9 +474,11 @@ def main() -> None:
             args.model_dir.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), args.model_dir / "best.pt")
             torch.save(
-                {"model": model.state_dict(), "args": vars(args), "metrics": vm},
+                {"model": model.state_dict(), "args": vars(args), "metrics": vm,
+                 "model_in": dst, "native": src, "metric_scale": metric_scale},
                 args.model_dir / "checkpoint_best.pt",
             )
+            _write_best_info(args.model_dir, dst, src, metric_scale, vm)
 
     if best is None:
         raise RuntimeError("no epoch ran")
@@ -373,7 +487,7 @@ def main() -> None:
 
     model.load_state_dict(torch.load(args.model_dir / "best.pt"))
     for split, pairs, lab in (("val", val_pairs, va_y), ("test", test_pairs, te_y)):
-        m = evaluate(model, pairs, lab, device, args.batch)
+        m = evaluate(model, pairs, lab, device, args.batch, scale=metric_scale)
         print(f"{split} final: {fmt(m)}")
 
     with (args.model_dir / "train_summary.json").open("w") as f:
@@ -381,6 +495,9 @@ def main() -> None:
             {
                 "best_epoch": ep_best,
                 "val": vm_best,
+                "model_in": dst,
+                "native": src,
+                "metric_scale": metric_scale,
                 "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             },
             f,

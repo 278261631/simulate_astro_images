@@ -99,12 +99,19 @@ def wrap_deg(a: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def random_snap(rng: np.random.RandomState) -> dict:
-    """Sample render options; GUI defaults are used as the centre of ranges."""
+def random_snap(rng: np.random.RandomState, args) -> dict:
+    """Sample render options; GUI defaults are used as the centre of ranges.
+
+    ``psf_sigma`` bounds come from ``args`` so the generator can be aimed at a
+    particular native resolution: the same star field rendered at a higher
+    pixel size keeps its pixel-space PSF (a camera is a camera), but after
+    down-sampling the PSF appears sharper. Use tighter/smaller bounds for large
+    ``--size`` outputs, wider bounds for small ones.
+    """
     return {
         "fov": float(rng.uniform(1.5, 8.0)),
         "max_mag": float(rng.uniform(9.0, 11.0)),
-        "psf_sigma": float(rng.uniform(0.7, 2.2)),
+        "psf_sigma": float(rng.uniform(args.psf_sigma_min, args.psf_sigma_max)),
         "gain": float(rng.uniform(1.2, 4.5)),
     }
 
@@ -235,13 +242,19 @@ class PairSampler:
         self.frac_lo = args.offset_frac_min
         self.frac_hi = args.offset_frac_max
 
-    def next_pair(self, frame_no: int, seed: int) -> dict:
-        """Build one pair. Returns record with A/B geometry + images."""
+    def next_pair(self, frame_no: int, seed: int, size: int | None = None) -> dict:
+        """Build one pair. Returns record with A/B geometry + images.
+
+        ``size`` overrides ``args.size`` for the pair (used by the smoke
+        dataset to mix different frame resolutions); ``None`` keeps the
+        dataset-wide value.
+        """
         args = self.args
         rng = self.rng
-        size = args.size
+        if size is None:
+            size = args.size
         fov = float(rng.uniform(args.fov_min, args.fov_max))
-        snap = random_snap(rng)
+        snap = random_snap(rng, args)
         snap.update(
             {
                 "width": size,
@@ -457,7 +470,13 @@ def run_split_images(sampler: "PairSampler", count: int, split: str,
     """
     split_dir = out_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
-    size = sampler.args.size
+    base_size = sampler.args.size
+    mix = getattr(sampler.args, "smoke_sizes", None) or []
+
+    def pair_size(i: int) -> int:
+        # round-robin over the requested sizes so every resolution is covered
+        return int(mix[i % len(mix)]) if mix else base_size
+
     labels = np.zeros((count, 3), dtype=np.float64)
     stars_a = np.zeros(count)
     fov = np.zeros(count)
@@ -466,8 +485,9 @@ def run_split_images(sampler: "PairSampler", count: int, split: str,
 
     for i in range(count):
         frame_no = 1 + i * 2 + (10_000_003 if split != "train" else 0)
-        rec = sampler.next_pair(frame_no, seed + i * 7919)
-        export_pair_images(split, i, rec, size, split_dir)
+        sz = pair_size(i)
+        rec = sampler.next_pair(frame_no, seed + i * 7919, size=sz)
+        export_pair_images(split, i, rec, sz, split_dir)
         labels[i] = rec["label"]
         stars_a[i] = rec["stars_a"]
         fov[i] = rec["fov"]
@@ -580,7 +600,13 @@ def add_smoke_group(p: argparse.ArgumentParser) -> None:
                    help="folder for the image/text smoke-test dataset "
                         "(default: data_smoke)")
     g.add_argument("--smoke-size", type=int, default=96,
-                   help="pixel size of the smoke frames")
+                   help="pixel size of the smoke frames (used when "
+                        "--smoke-sizes is empty)")
+    g.add_argument("--smoke-sizes", type=str, default="",
+                   help="comma-separated frame sizes to MIX into the smoke set, "
+                        "e.g. 64,128,192,384,512 (sizes are round-robined per "
+                        "split so each resolution appears); empty = every "
+                        "sample uses --smoke-size")
     g.add_argument("--smoke-train", type=int, default=16,
                    help="smoke train pairs")
     g.add_argument("--smoke-val", type=int, default=8,
@@ -603,6 +629,7 @@ def run_smoke(catalog: tuple, args) -> None:
     out.mkdir(parents=True, exist_ok=True)
     sa = argparse.Namespace(**vars(args))
     sa.size = args.smoke_size
+    sa.smoke_sizes = [int(x) for x in str(args.smoke_sizes).split(",") if x.strip()]
     sa.seed = args.seed + 8_000_017
     sampler = PairSampler(catalog, sa)
     t0 = time.perf_counter()
@@ -616,18 +643,20 @@ def run_smoke(catalog: tuple, args) -> None:
         summaries.append(s)
     print(f"\nsmoke total {time.perf_counter() - t0:.1f}s")
 
+    mix = sa.smoke_sizes
     params_txt = (
         "smoke test dataset (images + text labels)\n"
-        f"pixel size      {sa.size}\n"
-        f"fov range       {sa.fov_min:.1f} - {sa.fov_max:.1f} deg\n"
-        f"offset fraction {sa.offset_frac_min} - {sa.offset_frac_max} of FOV\n"
-        f"max |roll error| {sa.max_roll} deg\n"
-        f"seed            {sa.seed}\n"
-        f"\n"
-        f"label convention (per <index>.txt):\n"
-        f"  dx, dy   A's centre appears at B's centre + (dx, dy) px\n"
-        f"  droll    B roll - A roll, deg\n"
-        f"\n"
+        + (f"mixed sizes     {','.join(str(x) for x in mix)}\n" if mix
+           else f"pixel size      {sa.size}\n")
+        + f"fov range       {sa.fov_min:.1f} - {sa.fov_max:.1f} deg\n"
+        + f"offset fraction {sa.offset_frac_min} - {sa.offset_frac_max} of FOV\n"
+        + f"max |roll error| {sa.max_roll} deg\n"
+        + f"seed            {sa.seed}\n"
+        + f"\n"
+        + f"label convention (per <index>.txt):\n"
+        + f"  dx, dy   A's centre appears at B's centre + (dx, dy) px\n"
+        + f"  droll    B roll - A roll, deg\n"
+        + f"\n"
     )
     for s in summaries:
         print(s)
@@ -659,6 +688,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-roll", type=float, default=8.0,
                    help="max |roll error| between A and B in degrees")
     p.add_argument("--min-stars", type=int, default=5)
+    p.add_argument("--psf-sigma-min", type=float, default=0.7,
+                   help="lower PSF sigma bound (px) sampled per frame")
+    p.add_argument("--psf-sigma-max", type=float, default=2.2,
+                   help="upper PSF sigma bound (px) sampled per frame")
     p.add_argument("--dec-min", type=float, default=-75.0)
     p.add_argument("--dec-max", type=float, default=75.0)
     p.add_argument("--check-dir", type=Path, default=HERE / "check_data",
@@ -675,6 +708,8 @@ def main() -> None:
         raise FileNotFoundError(args.catalog)
     if not (0 < args.offset_frac_min <= args.offset_frac_max <= 0.5):
         raise ValueError("offset fraction must be within (0, 0.5]")
+    if not (0 < args.psf_sigma_min <= args.psf_sigma_max):
+        raise ValueError("psf_sigma_min must be <= psf_sigma_max")
     ra, dec, mag = load_catalog(args.catalog)
     print(f"catalog: {len(ra)} stars")
 
