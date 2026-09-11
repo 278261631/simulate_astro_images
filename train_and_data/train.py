@@ -32,11 +32,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import (  # noqa: E402
     DET_STRIDE,
     PairRegNet,
+    cluster_points,
     decode,
     encode_target,
     heat_to_peaks,
     preprocess,
 )
+
+#: class index of the satellite trail (appear=0, dim=1, satellite=2)
+SAT_CLS = 2
 
 
 def set_seed(seed: int) -> None:
@@ -334,44 +338,51 @@ def fmt(m: dict) -> str:
 
 
 def build_heat_targets(meta: dict, n: int, grid: int, sigma: float = 1.2,
-                       n_cls: int = 3) -> torch.Tensor | None:
-    """(n, C, grid, grid) int8 target tensor from meta trans arrays.
+                       n_cls: int = 4) -> torch.Tensor | None:
+    """(n, C, grid, grid) int8 target tensor from meta GT arrays.
 
-    CenterNet-style supervision: +1 at the source centre cell (radius ~1),
-    -1 in the ignore ring around it (not penalised either way), 0 elsewhere.
-    This avoids the dilute ring gradients of soft Gaussians and gives the
-    head a sharp positive target to drive peaks above threshold.
+    CenterNet-style supervision: +1 at each source centre cell (radius ~1),
+    -1 in the ignore ring around it, 0 elsewhere.  Point transients
+    (new/brighten/dim) come from ``trans_*``; satellite trails are stored as
+    multiple centreline points (class 3) in ``sat_*``.
     """
-    if "trans_n" not in meta:
+    if "trans_n" not in meta and "sat_n" not in meta:
         return None
-    tn = np.asarray(meta["trans_n"], dtype=np.int64)[:n]
-    tx = np.asarray(meta["trans_x"])
-    ty = np.asarray(meta["trans_y"])
-    tc = np.asarray(meta["trans_cls"])
+    tn = np.asarray(meta["trans_n"], dtype=np.int64)[:n] if "trans_n" in meta else np.zeros(n, np.int64)
+    tx = np.asarray(meta["trans_x"]) if "trans_x" in meta else np.zeros((n, 1))
+    ty = np.asarray(meta["trans_y"]) if "trans_y" in meta else np.zeros((n, 1))
+    tc = np.asarray(meta["trans_cls"]) if "trans_cls" in meta else np.zeros((n, 1))
+    sn = np.asarray(meta["sat_n"], dtype=np.int64)[:n] if "sat_n" in meta else np.zeros(n, np.int64)
+    sx = np.asarray(meta["sat_x"]) if "sat_x" in meta else np.zeros((n, 1))
+    sy = np.asarray(meta["sat_y"]) if "sat_y" in meta else np.zeros((n, 1))
     out = np.zeros((n, n_cls, grid, grid), dtype=np.int8)
+
+    def stamp(i: int, cl: int, cx: float, cy: float) -> None:
+        if not (0 <= cl < n_cls) or not (0 <= cx < grid) or not (0 <= cy < grid):
+            return
+        x0 = max(0, int(math.floor(cy)) - 2)
+        x1 = min(grid, int(math.ceil(cy)) + 3)
+        y0 = max(0, int(math.floor(cx)) - 2)
+        y1 = min(grid, int(math.ceil(cx)) + 3)
+        for yy in range(x0, x1):
+            for xx in range(y0, y1):
+                d = math.hypot(yy - cy, xx - cx)
+                if d <= 0.8:
+                    out[i, cl, yy, xx] = 1
+                elif d <= 1.8 and out[i, cl, yy, xx] == 0:
+                    out[i, cl, yy, xx] = -1
+
     for i in range(n):
-        k = int(tn[i])
-        if k <= 0:
-            continue
-        for j in range(k):
+        for j in range(int(tn[i])):
             if j >= tx.shape[1]:
                 break
-            cx = float(tx[i, j]) / float(DET_STRIDE)
-            cy = float(ty[i, j]) / float(DET_STRIDE)
-            cl = int(round(float(tc[i, j])))
-            if not (0 <= cl < n_cls) or not (0 <= cx < grid) or not (0 <= cy < grid):
-                continue
-            x0 = max(0, int(math.floor(cy)) - 2)
-            x1 = min(grid, int(math.ceil(cy)) + 3)
-            y0 = max(0, int(math.floor(cx)) - 2)
-            y1 = min(grid, int(math.ceil(cx)) + 3)
-            for yy in range(x0, x1):
-                for xx in range(y0, y1):
-                    d = math.hypot(yy - cy, xx - cx)
-                    if d <= 0.8:
-                        out[i, cl, yy, xx] = 1
-                    elif d <= 1.8 and out[i, cl, yy, xx] == 0:
-                        out[i, cl, yy, xx] = -1
+            stamp(i, int(round(float(tc[i, j]))),
+                  float(tx[i, j]) / DET_STRIDE, float(ty[i, j]) / DET_STRIDE)
+        for j in range(int(sn[i])):
+            if j >= sx.shape[1]:
+                break
+            stamp(i, SAT_CLS, float(sx[i, j]) / DET_STRIDE,
+                  float(sy[i, j]) / DET_STRIDE)
     return torch.as_tensor(out)
 
 
@@ -392,33 +403,69 @@ class TransientHeatLoss(nn.Module):
         ign = y < -0.5   # ignore ring
         lpos = -self.alpha * ((1.0 - p) ** self.gamma) * torch.log(p)
         lneg = -(1.0 - self.alpha) * (p ** self.gamma) * torch.log(1.0 - p)
-        loss = torch.zeros((), device=logits.device)
-        if pos.any():
-            loss = loss + lpos[pos].mean()
-        negc = ~pos & ~ign
-        if negc.any():
-            # hard-negative mining: penalise only the strongest false alarms,
-            # so the head collapses its background instead of averaging it.
-            vals = lneg[negc]
-            k = min(256, vals.numel())
-            loss = loss + self.neg_w * vals.topk(k).values.mean()
+        n_cls = logits.shape[1]
+        # Per-class balanced terms: satellite trails contribute dozens of GT
+        # points each, so a global positive mean would swamp the sparse
+        # point-source classes (new/brighten/dim).
+        pos_acc = torch.zeros((), device=logits.device)
+        neg_acc = torch.zeros((), device=logits.device)
+        n_pos = 0
+        n_neg = 0
+        for c in range(n_cls):
+            pc = pos[:, c]
+            if pc.any():
+                pos_acc = pos_acc + lpos[:, c][pc].mean()
+                n_pos += 1
+            negc = (~pos[:, c]) & (~ign[:, c])
+            if negc.any():
+                vals = lneg[:, c][negc]
+                k = min(256, vals.numel())
+                neg_acc = neg_acc + vals.topk(k).values.mean()
+                n_neg += 1
+        loss = pos_acc / max(1, n_pos) + self.neg_w * (neg_acc / max(1, n_neg))
         return loss
 
 
 def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
-                n_cls: int = 3) -> dict | None:
+                n_cls: int = 3, sat_cls: int = SAT_CLS,
+                sat_radius: float = 24.0) -> dict | None:
     """Peak-matching precision / recall per class.
 
-    ``model_pred_peaks``: per-sample list of (cls, x_px, y_px, score) in model
-    grid pixels (already back to native scale by caller); ``gt``: per-sample
-    list of (x, y, cls) native px.
+    Point classes (new/brighten/dim) are matched one-to-one.  Satellite GT is
+    stored as many centreline points; those are clustered into trail
+    *instances* and a hit on any point detects the whole trail (so recall is
+    not diluted by trail length).
     """
     n = len(model_pred_peaks)
     tp = np.zeros(n_cls); fp = np.zeros(n_cls); fn = np.zeros(n_cls)
     for i in range(n):
         gts = [(float(g[0]), float(g[1]), int(g[2])) for g in gt[i]]
         used_g = set()
+        sat_pts = [(g[0], g[1]) for g in gts if g[2] == sat_cls]
+        sat_inst = cluster_points(sat_pts, sat_radius) if sat_pts else []
+        matched_inst: set[int] = set()
+        # cluster_points returns indices into sat_pts; keep mapping for points
+        sat_origin = [(g[0], g[1]) for g in gts if g[2] == sat_cls]
+
         for (cl, x, y, s) in model_pred_peaks[i]:
+            if cl == sat_cls:
+                hit = None
+                for ii, grp in enumerate(sat_inst):
+                    for k in grp:
+                        gx, gy = sat_origin[k]
+                        if math.hypot(x - gx, y - gy) <= tol_px:
+                            hit = ii
+                            break
+                    if hit is not None:
+                        break
+                if hit is None:
+                    fp[sat_cls] += 1
+                elif hit not in matched_inst:
+                    tp[sat_cls] += 1
+                    matched_inst.add(hit)
+                # duplicate detection on an already-found trail: ignored
+                continue
+            # point classes
             best = None
             for gi, (gx, gy, gcl) in enumerate(gts):
                 if gi in used_g or gcl != cl:
@@ -431,18 +478,30 @@ def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
                 used_g.add(best[1])
             else:
                 fp[cl] += 1
+        # misses
         for gi, (gx, gy, gcl) in enumerate(gts):
+            if gcl == sat_cls:
+                continue
             if gi not in used_g:
                 fn[gcl] += 1
-    tot_g = sum(len(g) for g in gt)
-    tot_p = sum(len(s) for s in model_pred_peaks)
+        fn[sat_cls] += len(sat_inst) - len(matched_inst)
+
+    tot_g = int(tp.sum() + fn.sum())
+    tot_p = int(tp.sum() + fp.sum())
     tp_s, fp_s, fn_s = float(tp.sum()), float(fp.sum()), float(fn.sum())
     prec = tp_s / max(1e-9, tp_s + fp_s)
     rec = tp_s / max(1e-9, tp_s + fn_s)
     f1 = 2 * prec * rec / max(1e-9, prec + rec)
-    return {"det_prec": prec, "det_rec": rec, "det_f1": f1,
-            "det_tp": int(tp_s), "det_fp": int(fp_s), "det_fn": int(fn_s),
-            "det_gt": int(tot_g), "det_pred": int(tot_p)}
+    out = {"det_prec": prec, "det_rec": rec, "det_f1": f1,
+           "det_tp": int(tp_s), "det_fp": int(fp_s), "det_fn": int(fn_s),
+           "det_gt": tot_g, "det_pred": tot_p}
+    for c in range(n_cls):
+        p = tp[c] / max(1e-9, tp[c] + fp[c])
+        r = tp[c] / max(1e-9, tp[c] + fn[c])
+        out[f"det_c{c}_p"] = float(p)
+        out[f"det_c{c}_r"] = float(r)
+        out[f"det_c{c}_f1"] = float(2 * p * r / max(1e-9, p + r))
+    return out
 
 
 def fmt_det(d: dict) -> str:
@@ -455,7 +514,7 @@ def fmt_det(d: dict) -> str:
 @torch.no_grad()
 def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
              batch: int, scale: float = 1.0, det_gt: list | None = None,
-             det_scale: float = 1.0) -> dict:
+             det_scale: float = 1.0, det_n_cls: int = 4) -> dict:
     """pairs: (N,2,H,W) preprocessed; lab: (N,3) [dx, dy, droll_deg].
 
     ``scale`` converts the model's pixel predictions (valid in the *model
@@ -488,7 +547,7 @@ def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
     pred = np.concatenate(preds, axis=0)
     m = metrics(pred, lab)
     if peaks_all is not None and det_gt is not None:
-        m.update(det_metrics(peaks_all, det_gt, tol_px=scale * 8.0))
+        m.update(det_metrics(peaks_all, det_gt, tol_px=scale * 8.0, n_cls=det_n_cls))
     return m
 
 
@@ -538,6 +597,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--det-w", type=float, default=0.5,
                    help="weight of the transient heatmap loss (0 disables "
                         "detection training even if the data has GT)")
+    p.add_argument("--det-neg-w", type=float, default=1.0,
+                   help="weight of the hard-negative term in the detection "
+                        "loss (lower = less background suppression)")
     p.add_argument("--max-train", type=int, default=0,
                    help="cap the number of train samples actually used "
                         "(0 = all); handy to smoke-test on a huge dataset")
@@ -612,34 +674,48 @@ def main() -> None:
     test_det_gt = None
     test_det_targets = None
     tr_tn = tr_tx = tr_ty = tr_tc = None
+    tr_sn = tr_sx = tr_sy = None
 
     if (args.det_w > 0 and not roi_active and args.crop <= 0
             and (args.data / "train_meta.npz").exists()):
         zt = np.load(args.data / "train_meta.npz")
-        if "trans_n" in zt.files:
+        if "trans_n" in zt.files or "sat_n" in zt.files:
             det_active = True
-            n_cls = 3
+            has_sat = "sat_n" in zt.files
+            cls_max = -1
+            if "trans_cls" in zt.files and "trans_n" in zt.files:
+                tn_ = np.asarray(zt["trans_n"])
+                tc_ = np.asarray(zt["trans_cls"])
+                valid = [int(round(tc_[i, j])) for i in range(len(tn_))
+                         for j in range(int(tn_[i]))]
+                cls_max = max(valid) if valid else -1
+            n_cls = max(cls_max + 1, (SAT_CLS + 1) if has_sat else 0, 1)
             det_w = float(args.det_w)
-            tr_tn = np.asarray(zt["trans_n"])
-            tr_tx = np.asarray(zt["trans_x"])
-            tr_ty = np.asarray(zt["trans_y"])
-            tr_tc = np.asarray(zt["trans_cls"])
-            det_loss = TransientHeatLoss()
+            tr_tn = np.asarray(zt["trans_n"]) if "trans_n" in zt.files else None
+            tr_tx = np.asarray(zt["trans_x"]) if "trans_x" in zt.files else None
+            tr_ty = np.asarray(zt["trans_y"]) if "trans_y" in zt.files else None
+            tr_tc = np.asarray(zt["trans_cls"]) if "trans_cls" in zt.files else None
+            tr_sn = np.asarray(zt["sat_n"]) if has_sat else None
+            tr_sx = np.asarray(zt["sat_x"]) if has_sat else None
+            tr_sy = np.asarray(zt["sat_y"]) if has_sat else None
+            det_loss = TransientHeatLoss(neg_w=float(args.det_neg_w))
 
             def _load_trans_gt(path: Path, nn: int):
                 zp = np.load(path)
-                arr = {"trans_n": np.asarray(zp["trans_n"]),
-                       "trans_x": np.asarray(zp["trans_x"]),
-                       "trans_y": np.asarray(zp["trans_y"]),
-                       "trans_cls": np.asarray(zp["trans_cls"])}
-                tgt = build_heat_targets(arr, nn, grid)
+                arr = {k: np.asarray(zp[k]) for k in zp.files
+                       if k in ("trans_n", "trans_x", "trans_y", "trans_cls",
+                                "sat_n", "sat_x", "sat_y")}
+                tgt = build_heat_targets(arr, nn, grid, n_cls=n_cls)
                 gt = []
                 for i in range(nn):
                     row = []
-                    for j in range(int(arr["trans_n"][i])):
+                    for j in range(int(arr.get("trans_n", np.zeros(nn))[i])):
                         row.append((float(arr["trans_x"][i, j]),
                                     float(arr["trans_y"][i, j]),
                                     int(round(float(arr["trans_cls"][i, j])))))
+                    for j in range(int(arr.get("sat_n", np.zeros(nn))[i])):
+                        row.append((float(arr["sat_x"][i, j]),
+                                    float(arr["sat_y"][i, j]), SAT_CLS))
                     gt.append(row)
                 return tgt, gt
 
@@ -685,10 +761,14 @@ def main() -> None:
             yb = train_ys[torch.from_numpy(np.asarray(idx, dtype=np.int64))].clone()
             hb_raw = None
             if det_active:
-                hb_raw = build_heat_targets(
-                    {"trans_n": tr_tn[idx], "trans_x": tr_tx[idx],
-                     "trans_y": tr_ty[idx], "trans_cls": tr_tc[idx]},
-                    len(idx), grid)
+                meta_b = {}
+                if tr_tn is not None:
+                    meta_b.update({"trans_n": tr_tn[idx], "trans_x": tr_tx[idx],
+                                   "trans_y": tr_ty[idx], "trans_cls": tr_tc[idx]})
+                if tr_sn is not None:
+                    meta_b.update({"sat_n": tr_sn[idx], "sat_x": tr_sx[idx],
+                                   "sat_y": tr_sy[idx]})
+                hb_raw = build_heat_targets(meta_b, len(idx), grid, n_cls=n_cls)
             pairs, ys, hmaps = [], [], []
             for j in range(len(pb)):
                 p, y = pb[j], yb[j]
@@ -724,7 +804,8 @@ def main() -> None:
             nb += len(pb)
         sched.step()
         vm = evaluate(model, val_pairs, va_y, device, args.batch,
-                      scale=metric_scale, det_gt=val_det_gt if det_active else None)
+                      scale=metric_scale, det_gt=val_det_gt if det_active else None,
+                      det_n_cls=n_cls)
         det_str = fmt_det(vm) if det_active else ""
         print(
             f"ep {ep + 1:02d}/{args.epochs}  loss {tot_loss / nb:.4f}  "
@@ -755,7 +836,7 @@ def main() -> None:
         ("test", test_pairs, te_y, test_det_gt if det_active else None),
     ):
         m = evaluate(model, pairs, labn, device, args.batch, scale=metric_scale,
-                     det_gt=dgt)
+                     det_gt=dgt, det_n_cls=n_cls)
         line = f"{split} final: {fmt(m)}"
         if dgt is not None:
             line += f"  {fmt_det(m)}"

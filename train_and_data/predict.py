@@ -119,7 +119,7 @@ def main() -> None:
     dy /= s
     print(f"A center in B frame:  dx {dx:+.2f} px   dy {dy:+.2f} px   droll {roll:+.2f}\u00b0")
     print(f"shift B by {dx:+.2f}, {dy:+.2f} px and {-roll:+.2f}\u00b0 to align B onto A")
-    cls_names = ("new", "brighten", "move")
+    cls_names = ("appear", "dim", "satellite")
     if peaks:
         print("transient candidates in B frame (native px):")
         for cl, x, y, sc in peaks:

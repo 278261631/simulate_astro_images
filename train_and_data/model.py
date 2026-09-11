@@ -181,18 +181,55 @@ def decode(y_raw: torch.Tensor) -> torch.Tensor:
     return torch.stack([dx, dy, roll], dim=1)
 
 
-def build_model_from_state(sd: dict, n_cls: int = 3) -> PairRegNet:
+def build_model_from_state(sd: dict, n_cls: int | None = None) -> PairRegNet:
     """Instantiate PairRegNet matching an old/new state dict.
 
     Detection weights exist only in checkpoints trained with transient
-    detection; pose-only checkpoints get ``n_cls=0`` so the pose head loads
-    cleanly and ``forward`` returns ``det=None``.
+    detection; pose-only checkpoints get ``n_cls=0``. When detection weights
+    are present the class count is inferred from the head's output layer, so
+    both 3-class and 4-class checkpoints load correctly.
     """
-    has_det = any(k.startswith("det.") for k in sd.keys())
-    net = PairRegNet(n_cls=n_cls if has_det else 0)
+    inferred = 0
+    if any(k.startswith("det.") for k in sd.keys()):
+        cands = [int(v.shape[0]) for k, v in sd.items()
+                 if k.startswith("det.") and k.endswith("weight") and v.ndim == 4]
+        inferred = min(cands) if cands else 0
+    net = PairRegNet(n_cls=n_cls if n_cls is not None else inferred)
     net.load_state_dict(sd)
     net.eval()
     return net
+
+
+def cluster_points(points, radius: float = 24.0) -> list[list[int]]:
+    """Greedy single-linkage clustering of 2-D points; returns index groups.
+
+    Used to treat a satellite trail's centreline points as one instance for
+    evaluation (a hit on any point counts as detecting the whole trail).
+    """
+    n = len(points)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = points[i][0] - points[j][0]
+            dy = points[i][1] - points[j][1]
+            if dx * dx + dy * dy <= radius * radius:
+                union(i, j)
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
 
 
 def heat_to_peaks(prob: torch.Tensor, thresh: float = 0.35,

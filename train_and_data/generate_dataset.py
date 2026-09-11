@@ -69,8 +69,13 @@ DEFAULT_CATALOG = HERE.parent / "data" / "hip_catalog.csv"
 _LUM = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 # transient-source bookkeeping
-MAX_TRANSIENTS = 8                     # per-pair cap stored in *_meta.npz
-T_CLS = {"new": 0, "brighten": 1, "move": 2}
+MAX_TRANSIENTS = 8                     # point sources per pair stored in *_meta.npz
+MAX_SAT_POINTS = 96                    # satellite-trail GT points per pair
+# Classes: appear = new OR brightening (A absent/faint -> B bright), dim =
+# A bright -> B faint/absent, satellite = tumbling trail.
+T_CLS = {"appear": 0, "dim": 1, "satellite": 2}
+SAT_CLS = T_CLS["satellite"]
+SAT_PROFILES = ("flat", "center", "glint")
 
 
 def _tangent_xy_in_frame(ra_t: float, dec_t: float, geo: dict, fov: float,
@@ -168,10 +173,7 @@ def random_art(rng: np.random.RandomState) -> dict:
     art["meteor"] = rng.rand() < 0.3
     art["meteor_count"] = int(rng.randint(1, 2))
 
-    art["satellite"] = rng.rand() < 0.5
-    art["sat_count"] = int(rng.randint(1, 2))
-    art["sat_width"] = float(rng.uniform(0.4, 1.6))
-    art["sat_brightness"] = float(rng.uniform(0.05, 0.5))
+    art["satellite"] = False   # satellites are now sampled explicitly (with GT)
 
     art["seeing"] = rng.rand() < 0.8
     art["seeing_sigma"] = float(rng.uniform(0.0, 2.5))
@@ -230,12 +232,15 @@ def project_stars(ra_all, dec_all, mag_all, snap):
 
 
 def render_frame(snap: dict, art: dict, stars: dict,
-                 extra: tuple | None = None) -> np.ndarray:
+                 extra: tuple | None = None,
+                 satellites: list | None = None) -> np.ndarray:
     """(H, W, 3) float RGB in [0, 1] after PSF rendering + sky effects.
 
     ``extra`` = (x, y, mag) tangent-plane arrays of additional point sources
     (transients) rendered through the exact same PSF/tone-map as catalogue
     stars, but excluded from the spike/ghost bookkeeping (``eff_stars``).
+    ``satellites`` = list of trail parameter dicts drawn before the effects
+    (so they receive the same seeing/background treatment).
     """
     if extra is not None and len(extra[0]) > 0:
         xs = np.concatenate([stars["x"], extra[0]])
@@ -253,6 +258,11 @@ def render_frame(snap: dict, art: dict, stars: dict,
         psf_sigma=snap["psf_sigma"],
         gain=snap["gain"],
     )
+    for s in satellites or []:
+        sky_effects.draw_satellite_trail(
+            rgb, s["p0"], s["p1"], s["width"], s["brightness"],
+            bend_amp=s["bend_amp"], bend_waves=s["bend_waves"],
+            profile=s["profile"], phase=s["phase"])
     eff_stars = {
         "x": stars["xp"],
         "y": stars["yp"],
@@ -283,19 +293,17 @@ class PairSampler:
 
     def sample_transients(self, rng: np.random.RandomState, size: int, fov: float,
                           geo_a: dict, geo_b: dict) -> dict | None:
-        """Sample transient sources for one A/B pair.
+        """Sample point-source transient sources for one A/B pair.
 
-        Physical sources live in the sky (defined relative to A's centre);
-        each frame projects them with its own geometry, so a stationary
-        transient sits on the *same* catalogue-stars grid in both frames (no
-        mapping error), while a moving one is given its own B-frame position.
-
-        Returned extras are rendered in both frames via ``render_frame``; the
-        ground truth (for the detection head) is the source position **in
-        frame B's pixels** + class:
-            0 new       - visible in B only
-            1 brighten  - faint in A, bright in B (same sky position)
-            2 move      - bright in both frames, B position displaced
+        Each source lives at a fixed sky position (defined relative to A's
+        centre) and is rendered in both frames through the frame geometry.
+        The ground truth (for the detection head) is the source position in
+        frame B's pixels + class:
+            0 appear - absent/faint in A, clearly bright in B (merges the old
+                       'new' and 'brighten' cases; the A-side may be empty or a
+                       faint visible source)
+            1 dim    - clearly bright in A, much fainter (or gone) in B
+        Only strong changes are generated (no mild variations).
         """
         rate = float(getattr(self.args, "transient_rate", 0.0))
         if rate <= 0.0:
@@ -309,36 +317,29 @@ class PairSampler:
         xa, ya, ma, xb, yb, mb = [], [], [], [], [], []
         gt: list[tuple[float, float, float]] = []
         for _ in range(n):
-            cls = int(rng.choice([0, 1, 2], p=[0.4, 0.35, 0.25]))
+            cls = int(rng.choice([T_CLS["appear"], T_CLS["dim"]], p=[0.62, 0.38]))
             # position inside ~70% of the field so B's pointing offset/roll
-            # (and any motion) keeps the source inside both frames.
+            # keeps the source inside both frames.
             rho = half * 0.70 * math.sqrt(rng.uniform(0.0, 1.0))
             phi = rng.uniform(0.0, 2.0 * math.pi)
             u, v = rho * math.cos(phi), rho * math.sin(phi)
-            ra_a, dec_a = gnomonic_inverse_pt(u, v, geo_a["ra"], geo_a["dec"])
-            mag_a = 99.0
-            mag_b = 99.0
-            du = dv = 0.0
-            if cls == T_CLS["new"]:
-                mag_b = float(rng.uniform(1.0, 6.0))
-            elif cls == T_CLS["brighten"]:
-                mag_a = float(rng.uniform(7.5, 10.5))
-                mag_b = float(rng.uniform(1.0, 6.0))
-            else:  # move
-                mag_a = float(rng.uniform(3.5, 7.0))
-                mag_b = float(rng.uniform(1.5, 6.0))
-                ang = rng.uniform(0.0, 2.0 * math.pi)
-                dist = half * rng.uniform(0.04, 0.16)
-                du, dv = dist * math.cos(ang), dist * math.sin(ang)
+            ra, dec = gnomonic_inverse_pt(u, v, geo_a["ra"], geo_a["dec"])
+            mag_a, mag_b = 99.0, 99.0
+            if cls == T_CLS["appear"]:
+                # half the time absent in A ('new'), half a faint visible
+                # source ('brighten'); B is clearly bright either way
+                if rng.rand() < 0.5:
+                    mag_a = float(rng.uniform(9.5, 11.5))
+                mag_b = float(rng.uniform(0.0, 4.0))
+            else:  # dim: clearly bright in A, much fainter (or gone) in B
+                mag_a = float(rng.uniform(0.0, 4.5))
+                if rng.rand() < 0.4:
+                    mag_b = 99.0                       # vanished
+                else:
+                    mag_b = float(rng.uniform(9.5, 13.0))
 
-            if cls == T_CLS["move"]:
-                ra_b, dec_b = gnomonic_inverse_pt(
-                    u + du, v + dv, geo_a["ra"], geo_a["dec"])
-            else:
-                ra_b, dec_b = ra_a, dec_a
-
-            pA = _tangent_xy_in_frame(ra_a, dec_a, geo_a, fov)
-            pB = _tangent_xy_in_frame(ra_b, dec_b, geo_b, fov)
+            pA = _tangent_xy_in_frame(ra, dec, geo_a, fov)
+            pB = _tangent_xy_in_frame(ra, dec, geo_b, fov)
             if pA is None or pB is None:
                 continue
             px_b, py_b = _tangent_to_px(pB[0], pB[1], fov, size)
@@ -346,7 +347,8 @@ class PairSampler:
                 continue
             if mag_a < 90.0:
                 xa.append(pA[0]); ya.append(pA[1]); ma.append(mag_a)
-            xb.append(pB[0]); yb.append(pB[1]); mb.append(mag_b)
+            if mag_b < 90.0:
+                xb.append(pB[0]); yb.append(pB[1]); mb.append(mag_b)
             gt.append((px_b, py_b, float(cls)))
 
         if not gt:
@@ -355,6 +357,59 @@ class PairSampler:
         ex_b = (np.asarray(xb), np.asarray(yb), np.asarray(mb)) if xb else None
         return {"extra_a": ex_a, "extra_b": ex_b,
                 "gt": np.asarray(gt, dtype=np.float64)}
+
+    def sample_satellites(self, rng: np.random.RandomState, size: int, fov: float,
+                          geo_a: dict, geo_b: dict) -> dict | None:
+        """Sample 0-2 tumbling satellite trails for one A/B pair.
+
+        Appearance modes (mixed): 'single' = only visible in B (detectable),
+        'both' = a trail in each frame at different positions.  The GT is the
+        set of centreline points of the B-frame trail(s), class 'satellite'.
+        """
+        rate = float(getattr(self.args, "satellite_rate", 0.0))
+        if rate <= 0.0:
+            return None
+        n = int(rng.poisson(rate))
+        if n <= 0:
+            return None
+        n = min(n, 2)
+
+        def _trail() -> dict:
+            # random chord with endpoints on/near the frame border
+            p0 = (rng.uniform(-0.1, 1.1) * size, rng.uniform(-0.1, 1.1) * size)
+            p1 = (rng.uniform(-0.1, 1.1) * size, rng.uniform(-0.1, 1.1) * size)
+            return {
+                "p0": p0, "p1": p1,
+                "width": float(rng.uniform(0.6, 2.0)),
+                "brightness": float(rng.uniform(0.15, 0.6)),
+                "bend_amp": float(rng.uniform(0.0, 6.0)),
+                "bend_waves": float(rng.uniform(0.5, 2.5)),
+                "profile": str(rng.choice(SAT_PROFILES)),
+                "phase": float(rng.uniform(0.0, 2.0 * math.pi)),
+            }
+
+        b_trails: list[dict] = []
+        a_trails: list[dict] = []
+        gt: list[tuple[float, float]] = []
+        for _ in range(n):
+            both = rng.rand() < 0.5
+            tb = _trail()
+            # reject degenerate (too short) chords
+            if math.hypot(tb["p1"][0] - tb["p0"][0], tb["p1"][1] - tb["p0"][1]) < 0.4 * size:
+                continue
+            b_trails.append(tb)
+            for (gx, gy) in sky_effects.satellite_centerline(
+                    tb["p0"], tb["p1"], tb["bend_amp"], tb["bend_waves"],
+                    tb["phase"], spacing_px=8.0):
+                if 0.0 <= gx < size and 0.0 <= gy < size:
+                    gt.append((gx, gy))
+            if both:
+                a_trails.append(_trail())
+        if not gt:
+            return None
+        return {"a": a_trails, "b": b_trails,
+                "gt": np.asarray(gt, dtype=np.float64)}
+
 
     def next_pair(self, frame_no: int, seed: int, size: int | None = None) -> dict:
         """Build one pair. Returns record with A/B geometry + images.
@@ -410,16 +465,21 @@ class PairSampler:
         geo_b = {"ra": float(ra_b), "dec": float(dec_b), "roll": roll_b}
 
         trans = self.sample_transients(rng, size, fov, geo_a, geo_b)
+        sats = self.sample_satellites(rng, size, fov, geo_a, geo_b)
+        bg_lo, bg_hi = getattr(self.args, "bg_level_min", 0.0), getattr(self.args, "bg_level_max", 0.12)
 
         art_a = dict(art)
         art_a["frame"] = frame_no
+        art_a["bg_level"] = float(rng.uniform(bg_lo, bg_hi))
         art_b = dict(art)
         art_b["frame"] = frame_no + 1
+        art_b["bg_level"] = float(rng.uniform(bg_lo, bg_hi))
 
         snap_a = dict(snap)
         snap_a.update(geo_a)
         rgb_a = render_frame(snap_a, art_a, stars_a,
-                             extra=trans["extra_a"] if trans else None)
+                             extra=trans["extra_a"] if trans else None,
+                             satellites=sats["a"] if sats else None)
 
         probe_b = dict(snap)
         probe_b.update(geo_b)
@@ -428,7 +488,8 @@ class PairSampler:
             probe_b["min_stars"] = 0
             stars_b = project_stars(self.ra_all, self.dec_all, self.mag_all, probe_b)
         rgb_b = render_frame(snap, art_b, stars_b,
-                             extra=trans["extra_b"] if trans else None)
+                             extra=trans["extra_b"] if trans else None,
+                             satellites=sats["b"] if sats else None)
 
         dx, dy = self.a_center_in_b_px(geo_a, geo_b, fov, size)
         rec = {
@@ -445,9 +506,13 @@ class PairSampler:
             "droll": wrap_deg(roll_b - geo_a["roll"]),
             "stars_a": stars_a["count"],
             "stars_b": stars_b["count"] if stars_b is not None else 0,
+            "bg_a": float(art_a["bg_level"]),
+            "bg_b": float(art_b["bg_level"]),
         }
         if trans is not None:
             rec["gt_trans"] = trans["gt"]     # (K, 3) pxB_x, pxB_y, cls
+        if sats is not None:
+            rec["gt_sat"] = sats["gt"]        # (M, 2) pxB_x, pxB_y (class 3)
         return rec
 
     @staticmethod
@@ -467,6 +532,60 @@ class PairSampler:
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+
+
+def _check_indices(meta: dict, count: int, k: int, rng: np.random.RandomState) -> list[int]:
+    """Stratified sample indices: try to cover every transient class + satellite."""
+    if count <= 0 or k <= 0:
+        return []
+    k = min(k, count)
+    buckets: dict[str, list[int]] = {"appear": [], "dim": [],
+                                     "satellite": [], "none": []}
+    tn = meta.get("trans_n")
+    tx = meta.get("trans_cls")
+    sn = meta.get("sat_n")
+    for i in range(count):
+        tags = set()
+        if tn is not None:
+            for j in range(int(tn[i])):
+                tags.add(["appear", "dim", "satellite"][int(round(tx[i, j]))])
+        if sn is not None and int(sn[i]) > 0:
+            tags.add("satellite")
+        if not tags:
+            buckets["none"].append(i)
+        for t in tags:
+            buckets[t].append(i)
+    chosen: list[int] = []
+    order = ["appear", "dim", "satellite", "none"]
+    rng.shuffle(order)
+    for key in order:
+        if len(chosen) >= k:
+            break
+        pool = buckets[key]
+        if pool:
+            chosen.append(int(pool[rng.randint(len(pool))]))
+    if len(chosen) < k:
+        rest = [i for i in range(count) if i not in set(chosen)]
+        rng.shuffle(rest)
+        chosen.extend(rest[: k - len(chosen)])
+    return sorted(chosen)
+
+
+_CHECK_COLORS = {0: (255, 60, 60), 1: (60, 200, 255), 2: (200, 80, 255)}
+
+
+def _annotate(u8: np.ndarray, pts, cls=None, radius: int = 3) -> np.ndarray:
+    """Draw small coloured crosses on a grayscale image copy (for check PNGs)."""
+    h, w = u8.shape[:2]
+    out = np.dstack([u8, u8, u8]).astype(np.uint8) if u8.ndim == 2 else u8.copy()
+    for n, pt in enumerate(pts):
+        x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
+        c = _CHECK_COLORS.get(int(cls[n]) if cls is not None else 0, (255, 255, 255))
+        for d in range(-radius, radius + 1):
+            for xx, yy in ((x + d, y), (x, y + d)):
+                if 0 <= yy < h and 0 <= xx < w:
+                    out[yy, xx] = c
+    return out
 
 
 def export_check_samples(
@@ -524,10 +643,31 @@ def export_check_samples(
             return (np.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
         sa, sb = stretch(im_a[gi]), stretch(im_b[gi])
+        # annotate B with the GT (point classes + satellite centreline points)
+        p_pts, p_cls, s_pts = [], [], []
+        tn = int(meta["trans_n"][gi]) if "trans_n" in meta else 0
+        for j in range(tn):
+            p_pts.append((meta["trans_x"][gi, j], meta["trans_y"][gi, j]))
+            p_cls.append(int(round(meta["trans_cls"][gi, j])))
+        sn = int(meta["sat_n"][gi]) if "sat_n" in meta else 0
+        for j in range(sn):
+            s_pts.append((meta["sat_x"][gi, j], meta["sat_y"][gi, j]))
+        sb_ann = _annotate(sb, p_pts, p_cls) if p_pts else sb
+        if s_pts:
+            sb_ann = _annotate(sb_ann, s_pts, [SAT_CLS] * len(s_pts), radius=1)
+        sb3 = np.dstack([sb_ann, sb_ann, sb_ann]) if sb_ann.ndim == 2 else sb_ann
+        names = ["appear", "dim", "satellite"]
+        txt += (
+            f"transients       {[names[c] for c in p_cls]}\n"
+            f"satellite points {sn}\n"
+            f"sky background   A {meta.get('bg_a', np.zeros(1))[gi]:.3f}   "
+            f"B {meta.get('bg_b', np.zeros(1))[gi]:.3f}\n"
+        )
         Image.fromarray(sa).save(f"{stem}_a.png")
-        Image.fromarray(sb).save(f"{stem}_b.png")
-        gap = np.zeros((size, 4), dtype=np.uint8) + 255
-        Image.fromarray(np.concatenate([sa, gap, sb], axis=1)).save(f"{stem}_ab.png")
+        Image.fromarray(sb3).save(f"{stem}_b.png")
+        sa3 = np.dstack([sa, sa, sa]) if sa.ndim == 2 else sa
+        gap = np.zeros((size, 4, 3), dtype=np.uint8) + 255
+        Image.fromarray(np.concatenate([sa3, gap, sb3], axis=1)).save(f"{stem}_ab.png")
         stem.with_suffix(".txt").write_text(txt)
         written += 1
     return written
@@ -663,6 +803,12 @@ def run_split(
     meta["trans_x"] = np.full((count, MAX_TRANSIENTS), -1.0)
     meta["trans_y"] = np.full((count, MAX_TRANSIENTS), -1.0)
     meta["trans_cls"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    # satellite-trail GT (centreline points, class 3, padded with -1)
+    meta["sat_n"] = np.zeros(count, dtype=np.int32)
+    meta["sat_x"] = np.full((count, MAX_SAT_POINTS), -1.0)
+    meta["sat_y"] = np.full((count, MAX_SAT_POINTS), -1.0)
+    meta["bg_a"] = np.zeros(count)
+    meta["bg_b"] = np.zeros(count)
     seed = sampler.args.seed + 10_000_000 * (0 if split == "train" else 1)
 
     for i in range(count):
@@ -682,6 +828,8 @@ def run_split(
         meta["seed"][i] = rec["seed"]
         meta["stars_a"][i] = rec["stars_a"]
         meta["stars_b"][i] = rec["stars_b"]
+        meta["bg_a"][i] = rec.get("bg_a", 0.0)
+        meta["bg_b"][i] = rec.get("bg_b", 0.0)
         gt = rec.get("gt_trans")
         if gt is not None and len(gt):
             k = min(len(gt), MAX_TRANSIENTS)
@@ -689,6 +837,12 @@ def run_split(
             meta["trans_x"][i, :k] = gt[:k, 0]
             meta["trans_y"][i, :k] = gt[:k, 1]
             meta["trans_cls"][i, :k] = gt[:k, 2]
+        sg = rec.get("gt_sat")
+        if sg is not None and len(sg):
+            k = min(len(sg), MAX_SAT_POINTS)
+            meta["sat_n"][i] = k
+            meta["sat_x"][i, :k] = sg[:k, 0]
+            meta["sat_y"][i, :k] = sg[:k, 1]
         if (i + 1) % 25 == 0 or i == count - 1:
             el = time.perf_counter() - t0
             print(
@@ -703,8 +857,7 @@ def run_split(
     np.savez(out_dir / f"{split}_meta.npz", **meta)
 
     if check_dir is not None and check_count > 0 and count > 0:
-        k = min(check_count, count)
-        idxs = sorted(sampler.rng.choice(count, size=k, replace=False).tolist())
+        idxs = _check_indices(meta, count, check_count, sampler.rng)
         n_written = export_check_samples(
             split, idxs, im_a, im_b, labels, meta, size, check_dir
         )
@@ -821,10 +974,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-roll", type=float, default=8.0,
                    help="max |roll error| between A and B in degrees")
     p.add_argument("--transient-rate", type=float, default=1.2,
-                   help="mean number of transient sources per pair (Poisson); "
-                        "0 disables transient simulation. Classes: new / "
-                        "brighten / move, GT stored in *_meta.npz as "
-                        "trans_x/trans_y/trans_cls (position in B-frame px)")
+                   help="mean number of point-source transients per pair "
+                        "(Poisson); 0 disables. Classes: new / brighten / dim, "
+                        "GT in *_meta.npz trans_x/trans_y/trans_cls (B-frame px)")
+    p.add_argument("--satellite-rate", type=float, default=0.8,
+                   help="mean number of tumbling satellite trails per pair "
+                        "(Poisson, capped at 2); 0 disables. GT in "
+                        "*_meta.npz sat_x/sat_y (B-frame centreline points)")
+    p.add_argument("--bg-level-min", type=float, default=0.0,
+                   help="min uniform sky-background offset added per frame")
+    p.add_argument("--bg-level-max", type=float, default=0.12,
+                   help="max uniform sky-background offset (A/B sampled "
+                        "independently)")
     p.add_argument("--min-stars", type=int, default=5)
     p.add_argument("--psf-sigma-min", type=float, default=0.7,
                    help="lower PSF sigma bound (px) sampled per frame")
@@ -868,6 +1029,9 @@ def main() -> None:
                     "size": args.size,
                     "splits": summaries,
                     "label": "dx,dy = A-centre in B frame minus B-centre (px); droll = B-A (deg)",
+                    "transient_classes": {k: v for k, v in T_CLS.items()},
+                    "gt": ("trans_x/trans_y/trans_cls (points, B-frame px) and "
+                           "sat_x/sat_y (satellite centreline points, B-frame px)"),
                     "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
                 },
                 f,

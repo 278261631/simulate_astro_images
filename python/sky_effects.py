@@ -209,6 +209,94 @@ def add_satellite_trails(
         _paint_streak(image, p0, p1, sigma, lambda t: np.full(t.shape, brightness), color=(0.95, 0.97, 1.0))
 
 
+def satellite_centerline(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    bend_amp: float = 0.0,
+    bend_waves: float = 1.0,
+    phase: float = 0.0,
+    spacing_px: float = 8.0,
+) -> list[tuple[float, float]]:
+    """Centreline sample points of a (possibly tumbling) satellite trail."""
+    seg_x = p1[0] - p0[0]
+    seg_y = p1[1] - p0[1]
+    length = math.hypot(seg_x, seg_y)
+    if length < 1.0:
+        return []
+    ux, uy = seg_x / length, seg_y / length
+    nx, ny = -uy, ux
+    step = max(1, int(round(spacing_px / 0.5)))
+    n = int(math.ceil(length / 0.5)) + 1
+    pts: list[tuple[float, float]] = []
+    for i in range(0, n, step):
+        t = min(1.0, (i * 0.5) / length)
+        off = bend_amp * math.sin(2.0 * math.pi * bend_waves * t + phase)
+        pts.append((p0[0] + seg_x * t + nx * off, p0[1] + seg_y * t + ny * off))
+    return pts
+
+
+def _sat_amplitude(t: np.ndarray, brightness: float, profile: str,
+                   bend_waves: float, phase: float) -> np.ndarray:
+    if profile == "center":       # bright in the middle, fades to the ends
+        return brightness * (0.12 + 0.88 * np.sin(np.pi * t))
+    if profile == "glint":        # periodic tumbling glints along the trail
+        return brightness * (0.2 + 0.8 * np.abs(np.sin(
+            2.0 * math.pi * (bend_waves + 1.0) * t + phase)))
+    return np.full(t.shape, brightness, dtype=np.float64)
+
+
+def draw_satellite_trail(
+    image: np.ndarray,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    width_px: float,
+    brightness: float,
+    bend_amp: float = 0.0,
+    bend_waves: float = 1.0,
+    profile: str = "flat",
+    phase: float = 0.0,
+    color: tuple[float, float, float] = (0.95, 0.97, 1.0),
+) -> None:
+    """Draw one (possibly tumbling) satellite trail onto a float RGB image.
+
+    ``bend_amp`` bends/undulates the trail (tumbling attitude), ``profile``
+    controls the along-track brightness: 'flat', 'center' (bright middle,
+    dim ends) or 'glint' (periodic bright knots).
+    """
+    seg_x = p1[0] - p0[0]
+    seg_y = p1[1] - p0[1]
+    length = math.hypot(seg_x, seg_y)
+    if length < 1.0:
+        return
+    h, w = image.shape[:2]
+    ux, uy = seg_x / length, seg_y / length
+    nx, ny = -uy, ux
+    n = int(math.ceil(length / 0.5)) + 1
+    t = np.linspace(0.0, 1.0, n)
+    off = bend_amp * np.sin(2.0 * math.pi * bend_waves * t + phase)
+    cx = p0[0] + seg_x * t + nx * off
+    cy = p0[1] + seg_y * t + ny * off
+    amp = _sat_amplitude(t, brightness, profile, bend_waves, phase)
+    sigma = max(0.3, float(width_px))
+    max_off = int(math.ceil(3.0 * sigma))
+    mask = np.zeros((h, w), dtype=np.float32)
+    for d in range(-max_off, max_off + 1):
+        wd = amp * float(math.exp(-0.5 * (d / sigma) ** 2))
+        rows = np.rint(cy + ny * d).astype(np.int64)
+        cols = np.rint(cx + nx * d).astype(np.int64)
+        ok = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+        if ok.any():
+            np.add.at(mask, (rows[ok], cols[ok]), wd[ok].astype(np.float32))
+    _additive_mask_to_rgb(image, mask, color)
+
+
+def add_sky_background(image: np.ndarray, level: float) -> None:
+    """Uniform additive sky glow (airglow / light pollution) offset."""
+    if level <= 0.0:
+        return
+    image += float(level)
+
+
 def _random_edge_points(rng: np.random.RandomState, w: int, h: int) -> tuple[tuple[float, float], tuple[float, float]]:
     points: list[tuple[float, float]] = []
     for _ in range(2):
@@ -379,6 +467,11 @@ def apply_effects(
     out = np.clip(image, 0.0, 1.0).astype(np.float32, copy=True)
     seed = int(art.get("seed", 0))
     frame = int(art.get("frame", 0))
+
+    # --- sky background (uniform glow; A/B sampled independently) ---
+    bg = float(art.get("bg_level", 0.0))
+    if bg > 0.0:
+        add_sky_background(out, bg)
 
     # --- optical / atmosphere (before detector effects) ---
     if art.get("spike", False):

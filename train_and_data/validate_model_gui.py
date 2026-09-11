@@ -77,6 +77,7 @@ if str(HERE) not in sys.path:
 from model import (  # noqa: E402
     PairRegNet,
     build_model_from_state,
+    cluster_points,
     decode,
     heat_to_peaks,
     preprocess,
@@ -199,15 +200,23 @@ class SplitData:
         return dict(row) if row else {}
 
     def det_gt(self, i: int) -> list[tuple[float, float, int]]:
-        """Ground-truth transients for sample i as (x, y, cls) in B-frame px."""
-        if self.trans is None or "trans_n" not in self.trans:
+        """Ground-truth transients for sample i as (x, y, cls) in B-frame px.
+
+        Class 0 = appear, 1 = dim point sources; class 2 = satellite trail
+        centreline points.
+        """
+        if self.trans is None:
             return []
-        n = int(self.trans["trans_n"][i])
         out = []
-        for j in range(n):
-            out.append((float(self.trans["trans_x"][i, j]),
-                        float(self.trans["trans_y"][i, j]),
-                        int(round(float(self.trans["trans_cls"][i, j])))))
+        if "trans_n" in self.trans:
+            for j in range(int(self.trans["trans_n"][i])):
+                out.append((float(self.trans["trans_x"][i, j]),
+                            float(self.trans["trans_y"][i, j]),
+                            int(round(float(self.trans["trans_cls"][i, j])))))
+        if "sat_n" in self.trans:
+            for j in range(int(self.trans["sat_n"][i])):
+                out.append((float(self.trans["sat_x"][i, j]),
+                            float(self.trans["sat_y"][i, j]), 2))
         return out
 
 
@@ -243,6 +252,11 @@ def load_numpy_split(data_dir: Path, split: str) -> SplitData:
                      "trans_x": np.asarray(mz["trans_x"]),
                      "trans_y": np.asarray(mz["trans_y"]),
                      "trans_cls": np.asarray(mz["trans_cls"])}
+        if "sat_n" in mz.files:
+            trans = trans or {}
+            trans.update({"sat_n": np.asarray(mz["sat_n"]),
+                          "sat_x": np.asarray(mz["sat_x"]),
+                          "sat_y": np.asarray(mz["sat_y"])})
     return SplitData(a, b, lab, _numpy_meta_rows(len(a), meta), trans=trans)
 
 
@@ -410,7 +424,7 @@ def to_pixmap(arr, max_side: int) -> QPixmap:
     return pm.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
-_DET_COLORS = {0: (255, 40, 40), 1: (255, 170, 40), 2: (200, 60, 255)}
+_DET_COLORS = {0: (255, 40, 40), 1: (60, 200, 255), 2: (200, 80, 255)}
 
 
 def annotate_markers(u8: np.ndarray, pts, use_class: bool = True,
@@ -444,13 +458,37 @@ def annotate_markers(u8: np.ndarray, pts, use_class: bool = True,
     return out
 
 
-def det_summary(records: list[dict], src: "SplitData", tol_px: float = 8.0) -> dict:
-    """Aggregate transient detection P/R against split GT (native B-frame px)."""
+def det_summary(records: list[dict], src: "SplitData", tol_px: float = 8.0,
+                sat_cls: int = 2, sat_radius: float = 24.0) -> dict:
+    """Aggregate transient detection P/R against split GT (native B-frame px).
+
+    Point classes are matched one-to-one; satellite trails are clustered into
+    instances so a hit on any centreline point detects the whole trail.
+    """
     tp = fp = fn = 0
     for i, r in enumerate(records):
         gts = src.det_gt(i)
+        sat_origin = [(g[0], g[1]) for g in gts if g[2] == sat_cls]
+        sat_inst = cluster_points(sat_origin, sat_radius) if sat_origin else []
+        matched_inst: set[int] = set()
         used = set()
         for (cl, x, y, s) in r["det"]:
+            if cl == sat_cls:
+                hit = None
+                for ii, grp in enumerate(sat_inst):
+                    for k in grp:
+                        gx, gy = sat_origin[k]
+                        if math.hypot(x - gx, y - gy) <= tol_px:
+                            hit = ii
+                            break
+                    if hit is not None:
+                        break
+                if hit is None:
+                    fp += 1
+                elif hit not in matched_inst:
+                    tp += 1
+                    matched_inst.add(hit)
+                continue
             best = None
             for gi, (gx, gy, gcl) in enumerate(gts):
                 if gi in used or gcl != cl:
@@ -463,7 +501,12 @@ def det_summary(records: list[dict], src: "SplitData", tol_px: float = 8.0) -> d
                 used.add(best[1])
             else:
                 fp += 1
-        fn += len(gts) - len(used)
+        for gi, (gx, gy, gcl) in enumerate(gts):
+            if gcl == sat_cls:
+                continue
+            if gi not in used:
+                fn += 1
+        fn += len(sat_inst) - len(matched_inst)
     prec = tp / max(1e-9, tp + fp)
     rec = tp / max(1e-9, tp + fn)
     return {"prec": prec, "rec": rec,
