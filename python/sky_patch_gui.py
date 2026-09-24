@@ -31,6 +31,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -46,6 +47,26 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+#: sensor-border choices for the crop model (at most two adjacent sides)
+BORDER_ITEMS = [
+    ("none", ()),
+    ("top", ("top",)),
+    ("bottom", ("bottom",)),
+    ("left", ("left",)),
+    ("right", ("right",)),
+    ("top-left", ("top", "left")),
+    ("top-right", ("top", "right")),
+    ("bottom-left", ("bottom", "left")),
+    ("bottom-right", ("bottom", "right")),
+]
+
+
+def _make_border_combo(parent) -> QComboBox:
+    combo = QComboBox(parent)
+    for label, _ in BORDER_ITEMS:
+        combo.addItem(label)
+    return combo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -929,6 +950,23 @@ class SkyPatchGui(QMainWindow):
             "Ghost reflections",
             [("int", _make_fspin(group, 0.0, 1.5, 2, 0.05, 0.5))],
         )
+        effect(
+            "optical_black",
+            "Optical black (shielded border)",
+            [
+                ("border", _make_border_combo(group)),
+                ("width", _make_ispin(group, 0, 512, 4, 40)),
+            ],
+        )
+        effect(
+            "shading",
+            "Edge shading (darker border)",
+            [
+                ("border", _make_border_combo(group)),
+                ("width", _make_ispin(group, 0, 512, 4, 48)),
+                ("drop%", _make_fspin(group, 0.0, 80.0, 0, 5.0, 25.0)),
+            ],
+        )
 
         left_layout = left.layout()
         left_layout.addWidget(group)
@@ -950,6 +988,9 @@ class SkyPatchGui(QMainWindow):
 
         def ival(spin: QSpinBox) -> int:
             return int(spin.value())
+
+        def border_sides(combo: QComboBox) -> tuple:
+            return BORDER_ITEMS[int(combo.currentIndex())][1]
 
         art = {
             "pointing": is_on("pointing"),
@@ -975,8 +1016,24 @@ class SkyPatchGui(QMainWindow):
             "spike_int": fval(param_widgets("spike")[1]),
             "ghost": is_on("ghost"),
             "ghost_int": fval(param_widgets("ghost")[0]),
+            "optical_black": is_on("optical_black"),
+            "ob_level": 0.02,
+            "ob_noise_sigma": 0.006,
+            "shading": is_on("shading"),
+            "shading_drop": fval(param_widgets("shading")[2]) / 100.0,
             "seed": int(self.spin_seed.value()),
         }
+        for side in ("top", "bottom", "left", "right"):
+            art[f"ob_{side}"] = 0
+            art[f"shading_{side}"] = 0
+        ob_sides = border_sides(param_widgets("optical_black")[0])
+        ob_w = ival(param_widgets("optical_black")[1])
+        for side in ob_sides:
+            art[f"ob_{side}"] = ob_w
+        sh_sides = border_sides(param_widgets("shading")[0])
+        sh_w = ival(param_widgets("shading")[1])
+        for side in sh_sides:
+            art[f"shading_{side}"] = sh_w
         return art
 
     def _refresh_art_widget_enabled(self) -> None:

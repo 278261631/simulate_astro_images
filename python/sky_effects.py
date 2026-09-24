@@ -100,6 +100,135 @@ def add_sensor_noise(image: np.ndarray, sigma: float, bias: float, seed: int, fr
     _additive_mask_to_rgb(image, noise, (1.0, 1.0, 1.0))
 
 
+#: border side names indexed the same way everywhere (top, bottom, left, right)
+SIDES = ("top", "bottom", "left", "right")
+#: the four *adjacent* side pairs a rectangular crop can touch together
+ADJACENT_SIDES = ((0, 2), (0, 3), (1, 2), (1, 3))  # (top,left) (top,right) ...
+
+
+def sample_sensor_framing(rng: np.random.RandomState, size: int) -> dict:
+    """Sample the sensor-border appearance of one exposure.
+
+    The rendered frame is modelled as a *crop* of a larger sensor, so it can
+    touch the physical sensor border on **at most two adjacent sides** (an
+    interior crop touches none, an edge crop one, a corner crop two).  Along a
+    touched border we optionally simulate:
+
+    * optical black - shielded columns/rows that only see dark current, and
+    * structural shading - edge pixels with reduced response (darker).
+
+    Called independently per exposure: A and B need not come from the same
+    camera, so each frame gets its own border.  Returns a flat dict with the
+    ``optical_black`` / ``shading`` keys understood by ``apply_effects``.
+    """
+    frame: dict = {
+        "optical_black": False,
+        "ob_top": 0, "ob_bottom": 0, "ob_left": 0, "ob_right": 0,
+        "ob_level": float(rng.uniform(0.0, 0.03)),
+        "ob_noise_sigma": float(rng.uniform(0.003, 0.012)),
+        "shading": False,
+        "shading_top": 0, "shading_bottom": 0, "shading_left": 0, "shading_right": 0,
+        "shading_drop": float(rng.uniform(0.10, 0.40)),
+    }
+
+    # Most crops are well inside the active area; only some touch a border.
+    r = rng.rand()
+    if r < 0.60:
+        sides: tuple[int, ...] = ()
+    elif r < 0.82:
+        sides = (int(rng.randint(0, 4)),)
+    else:
+        sides = ADJACENT_SIDES[int(rng.randint(0, 4))]
+
+    for s in sides:
+        name = SIDES[s]
+        if rng.rand() < 0.65:
+            frame["optical_black"] = True
+            # wide shielded band: 4-22% of the short side
+            frame[f"ob_{name}"] = int(round(rng.uniform(0.04, 0.22) * size))
+        if rng.rand() < 0.55:
+            frame["shading"] = True
+            # even wider shaded roll-off: 6-30% of the short side
+            frame[f"shading_{name}"] = int(round(rng.uniform(0.06, 0.30) * size))
+    return frame
+
+
+def apply_optical_black(
+    image: np.ndarray,
+    top: int = 0,
+    bottom: int = 0,
+    left: int = 0,
+    right: int = 0,
+    level: float = 0.02,
+    noise_sigma: float = 0.005,
+    seed: int = 0,
+    frame: int = 0,
+) -> None:
+    """Replace shielded (optical-black) border bands with black level + noise.
+
+    OB pixels are covered by metal so they do not collect photons; their output
+    is dominated by dark current + read noise.  Each side is independent: a
+    crop of a larger sensor usually touches at most two adjacent borders.
+    Applied in-place.
+    """
+    if top <= 0 and bottom <= 0 and left <= 0 and right <= 0:
+        return
+    h, w = image.shape[:2]
+    rng = _transient_rng(seed, frame)
+    base = max(0.0, min(1.0, level))
+    sigma = max(0.0, noise_sigma)
+
+    def _fill(y0: int, y1: int, x0: int, x1: int) -> None:
+        region = image[y0:y1, x0:x1]
+        rh, rw = region.shape[:2]
+        if rh == 0 or rw == 0:
+            return
+        noise = rng.normal(0.0, sigma, size=(rh, rw)).astype(np.float32)
+        region[...] = np.clip(base + noise, 0.0, 1.0)[..., None]
+
+    t, b = min(max(0, top), h), min(max(0, bottom), h)
+    l, rgt = min(max(0, left), w), min(max(0, right), w)
+    if t:
+        _fill(0, t, 0, w)
+    if b:
+        _fill(h - b, h, 0, w)
+    if l:
+        _fill(0, h, 0, l)
+    if rgt:
+        _fill(0, h, w - rgt, w)
+
+
+def apply_sensor_shading(
+    image: np.ndarray,
+    top: int = 0,
+    bottom: int = 0,
+    left: int = 0,
+    right: int = 0,
+    drop: float = 0.15,
+) -> None:
+    """Apply multiplicative shading to edge bands (structural shadowing).
+
+    Reduces the response of the outermost rows/columns, e.g. from a filter
+    wheel, cryostat window or package edge.  ``drop`` is the fractional
+    reduction (0 = no shading).  Sides are independent (crop model).
+    """
+    if drop <= 0.0 or (top + bottom + left + right) == 0:
+        return
+    h, w = image.shape[:2]
+    factor = 1.0 - max(0.0, min(1.0, drop))
+    if factor >= 1.0:
+        return
+
+    if top > 0:
+        image[:min(top, h), :] *= factor
+    if bottom > 0:
+        image[max(0, h - bottom):, :] *= factor
+    if left > 0:
+        image[:, :min(left, w)] *= factor
+    if right > 0:
+        image[:, max(0, w - right):] *= factor
+
+
 def add_cosmic_rays(image: np.ndarray, count: int, seed: int, frame: int) -> None:
     """Random short bright streaks typical of CCD/CMOS cosmic-ray hits."""
     rng = _transient_rng(seed * 3 + 1, frame)
@@ -498,6 +627,17 @@ def apply_effects(
     if art.get("seeing", False) and seeing_sigma > 0.0:
         out = blur_image(out, seeing_sigma)
 
+    # --- sensor response shading (edge rows/columns respond less) ---
+    if art.get("shading", False):
+        apply_sensor_shading(
+            out,
+            top=int(art.get("shading_top", 0)),
+            bottom=int(art.get("shading_bottom", 0)),
+            left=int(art.get("shading_left", 0)),
+            right=int(art.get("shading_right", 0)),
+            drop=float(art.get("shading_drop", 0.15)),
+        )
+
     # --- sensor-plane shadows ---
     if art.get("dust", False):
         dust_seed = seed
@@ -524,6 +664,21 @@ def apply_effects(
             float(art.get("noise_bias", 0.05)),
             seed,
             frame,
+        )
+
+    # --- readout framing (optical black, applied last: shielded pixels
+    #     override any signal collected there) ---
+    if art.get("optical_black", False):
+        apply_optical_black(
+            out,
+            top=int(art.get("ob_top", 0)),
+            bottom=int(art.get("ob_bottom", 0)),
+            left=int(art.get("ob_left", 0)),
+            right=int(art.get("ob_right", 0)),
+            level=float(art.get("ob_level", 0.02)),
+            noise_sigma=float(art.get("ob_noise_sigma", 0.005)),
+            seed=seed,
+            frame=frame,
         )
 
     return np.clip(out, 0.0, 1.0)

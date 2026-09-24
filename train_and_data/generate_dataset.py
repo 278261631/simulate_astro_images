@@ -184,6 +184,9 @@ def random_art(rng: np.random.RandomState) -> dict:
 
     art["ghost"] = rng.rand() < 0.5
     art["ghost_int"] = float(rng.uniform(0.05, 0.7))
+    # NOTE: sensor framing (optical black / edge shading) is *not* set here:
+    # the frame is a crop of a larger sensor and A/B may come from different
+    # cameras, so each exposure samples its own border in ``next_pair``.
     return art
 
 
@@ -468,12 +471,17 @@ class PairSampler:
         sats = self.sample_satellites(rng, size, fov, geo_a, geo_b)
         bg_lo, bg_hi = getattr(self.args, "bg_level_min", 0.0), getattr(self.args, "bg_level_max", 0.12)
 
+        # Sensor framing is sampled independently per exposure: the frame is a
+        # crop of a larger sensor (at most two adjacent borders) and A/B need
+        # not share the same camera, so their borders are unrelated.
         art_a = dict(art)
         art_a["frame"] = frame_no
         art_a["bg_level"] = float(rng.uniform(bg_lo, bg_hi))
+        art_a.update(sky_effects.sample_sensor_framing(rng, size))
         art_b = dict(art)
         art_b["frame"] = frame_no + 1
         art_b["bg_level"] = float(rng.uniform(bg_lo, bg_hi))
+        art_b.update(sky_effects.sample_sensor_framing(rng, size))
 
         snap_a = dict(snap)
         snap_a.update(geo_a)
