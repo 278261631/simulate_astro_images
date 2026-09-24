@@ -327,10 +327,10 @@ class PairSampler:
             mag_a, mag_b = 99.0, 99.0
             if cls == T_CLS["appear"]:
                 # half the time absent in A ('new'), half a faint visible
-                # source ('brighten'); B is clearly bright either way
+                # source ('brighten'); B ranges from bright to moderate
                 if rng.rand() < 0.5:
                     mag_a = float(rng.uniform(9.5, 11.5))
-                mag_b = float(rng.uniform(0.0, 4.0))
+                mag_b = float(rng.uniform(0.0, 9.0))
             else:  # dim: clearly bright in A, much fainter (or gone) in B
                 mag_a = float(rng.uniform(0.0, 4.5))
                 if rng.rand() < 0.4:
