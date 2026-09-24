@@ -112,13 +112,33 @@ def main() -> None:
 
     pair = preprocess(ia, ib).unsqueeze(0)  # (1, 2, H, W)
     with torch.no_grad():
-        pose, det = model(pair)
+        pose, det, ob = model(pair)
         dx, dy, roll = decode(pose)[0].tolist()
         peaks = heat_to_peaks(torch.sigmoid(det))[0] if det is not None else []
+        # channel 1 = frame B (peaks are reported in B frame): unusable mask
+        ob_b = None
+        if ob is not None and ob.shape[1] > 1:
+            ob_b = (torch.sigmoid(ob[0, 1]) > 0.5).numpy()   # (model, model)
     dx /= s
     dy /= s
     print(f"A center in B frame:  dx {dx:+.2f} px   dy {dy:+.2f} px   droll {roll:+.2f}\u00b0")
     print(f"shift B by {dx:+.2f}, {dy:+.2f} px and {-roll:+.2f}\u00b0 to align B onto A")
+
+    dropped = 0
+    if ob_b is not None:
+        cov = float(ob_b.mean())
+        print(f"B-frame unusable (OB/shaded) region: {cov * 100:.1f}% of pixels")
+        # drop detections that fall inside the unusable border ("avoid")
+        kept = []
+        for cl, x, y, sc in peaks:
+            xi = min(ob_b.shape[1] - 1, max(0, int(round(x))))  # model-grid px
+            yi = min(ob_b.shape[0] - 1, max(0, int(round(y))))
+            if ob_b[yi, xi]:
+                dropped += 1
+                continue
+            kept.append((cl, x, y, sc))
+        peaks = kept
+
     cls_names = ("appear", "dim", "satellite")
     if peaks:
         print("transient candidates in B frame (native px):")
@@ -128,6 +148,8 @@ def main() -> None:
             print(f"  {cls_names[cl]:>8}  x {x:7.1f}  y {y:7.1f}  score {sc:.2f}")
     elif det is not None:
         print("transient candidates: none above threshold")
+    if dropped:
+        print(f"({dropped} candidate(s) suppressed inside the unusable region)")
 
 
 if __name__ == "__main__":

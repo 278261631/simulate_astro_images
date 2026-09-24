@@ -83,16 +83,19 @@ class ConvBlock(nn.Module):
 
 class PairRegNet(nn.Module):
     def __init__(self, in_ch: int = 2, feat: int = 32, drop: float = 0.15,
-                 pool_grid: int = 16, n_cls: int = 3) -> None:
-        """Pose regression + (optional) transient heatmap detection.
+                 pool_grid: int = 16, n_cls: int = 3, n_mask: int = 0) -> None:
+        """Pose regression + transient heatmap detection + OB mask segmentation.
 
-        ``n_cls > 0`` enables a second head that turns the stride-8 feature map
-        into ``n_cls`` per-class Gaussian heatmaps (transient presence per
-        pixel).  n_cls=0 keeps the original pose-only network (backwards
-        compatible with checkpoints saved before detection existed).
+        ``n_cls > 0`` enables the transient heatmap head (per-class Gaussian
+        peaks).  ``n_mask > 0`` enables a full-resolution segmenter that marks
+        unusable sensor regions (optical black / shaded borders) for every
+        input frame (channel 0 = A, channel 1 = B), so detectors can avoid
+        them.  Both default off, keeping pose-only / detection-only checkpoints
+        fully backwards compatible.
         """
         super().__init__()
         self.n_cls = int(n_cls)
+        self.n_mask = int(n_mask)
         ch = in_ch
         body = []
         for i in range(3):
@@ -112,11 +115,13 @@ class PairRegNet(nn.Module):
             nn.Linear(512, 4),
         )
         self.det = None
+        self.ob = None
         self.res_enc = None
-        if self.n_cls > 0:
+        if self.n_cls > 0 or self.n_mask > 0:
             # Residual encoder: turns (A, aligned-B, |A - aligned-B|) into a
             # stride-8 feature map. Ordinary stars cancel in the residual so
-            # they do not become detection candidates.
+            # they do not become detection candidates; the dark border bands
+            # survive in both frames' channels for the OB segmenter.
             self.res_enc = nn.Sequential(
                 nn.Conv2d(3, 32, 3, padding=1),
                 nn.BatchNorm2d(32),
@@ -126,6 +131,7 @@ class PairRegNet(nn.Module):
                 ConvBlock(feat * 2, feat * 2, stride=2),
             )
             din = ch + feat * 2
+        if self.n_cls > 0:
             # Detection decoder on the concatenated stride-8 features, then a
             # 2x transposed-conv upsample to stride-4 resolution and a 1x1
             # classifier.
@@ -147,28 +153,62 @@ class PairRegNet(nn.Module):
             for m in self.det.modules():
                 if isinstance(m, nn.Conv2d) and m.out_channels == self.n_cls:
                     nn.init.constant_(m.bias, -5.0)
+        if self.n_mask > 0:
+            # Full-resolution segmenter: three transposed-conv upsamples take
+            # the stride-8 feature back to stride-1, then a 1x1 classifier.
+            self.ob = nn.Sequential(
+                nn.Conv2d(din, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                ConvBlock(64, 64),
+                nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.ConvTranspose2d(16, 16, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, self.n_mask, 1),
+            )
+            for m in self.ob.modules():
+                if isinstance(m, nn.Conv2d) and m.out_channels == self.n_mask:
+                    nn.init.constant_(m.bias, -1.0)
 
-    def forward(self, pair: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """pair: (B, 2, H, W) float -> (pose(B,4), det(B,n_cls,H/4,W/4) or None).
+    def forward(self, pair: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """pair: (B, 2, H, W) float -> (pose, det, ob).
 
-        Pose: global regression on the reduced stride-8 features.
-        Detection: channel B is warped onto A with the *predicted* pose
-        (detached, so detection gradients never damage the pose head), the
-        three-channel residual is encoded to stride-8 and fused with the
-        body features, then decoded to per-class stride-4 heatmaps.
+        pose : (B, 4)          global pose regression
+        det  : (B, n_cls, H/4, W/4) or None   per-class transient heatmaps
+        ob   : (B, n_mask, H, W) or None      per-frame unusable-region logits
+
+        Det/OB share the stride-8 fused features; B is warped onto A with the
+        *predicted, detached* pose so their gradients never damage the pose
+        head.
         """
         f = self.body(pair)
         pose = self.head(self.reduce(f))
         det = None
-        if self.det is not None:
+        ob = None
+        if self.res_enc is not None:
             dx = pose[:, 0]
             dy = pose[:, 1]
             roll = torch.atan2(pose[:, 3], pose[:, 2])
             wb = _warp_b_to_a(pair, dx, dy, roll)
             res = (pair[:, 0:1] - wb).abs()
             rfeat = self.res_enc(torch.cat([pair[:, 0:1], wb, res], dim=1))
-            det = self.det(torch.cat([f, rfeat], dim=1))
-        return pose, det
+            feat = torch.cat([f, rfeat], dim=1)
+            if self.det is not None:
+                det = self.det(feat)
+            if self.ob is not None:
+                ob = self.ob(feat)
+                if ob.shape[-2:] != pair.shape[-2:]:
+                    ob = nn.functional.interpolate(
+                        ob, size=pair.shape[-2:], mode="bilinear",
+                        align_corners=False)
+        return pose, det, ob
 
 
 def decode(y_raw: torch.Tensor) -> torch.Tensor:
@@ -181,20 +221,36 @@ def decode(y_raw: torch.Tensor) -> torch.Tensor:
     return torch.stack([dx, dy, roll], dim=1)
 
 
-def build_model_from_state(sd: dict, n_cls: int | None = None) -> PairRegNet:
+def _infer_head_out(sd: dict, prefix: str) -> int:
+    """Infer a head's output channel count from a state dict.
+
+    The output layer (n_cls / n_mask) is far smaller than any intermediate
+    channel, so the minimum over all 4-D weight dimensions is the head width;
+    this is agnostic to Conv2d (out = shape[0]) vs ConvTranspose2d (out =
+    shape[1]).
+    """
+    cands: list[int] = []
+    for k, v in sd.items():
+        if k.startswith(prefix) and k.endswith("weight") and v.ndim == 4:
+            cands.extend((int(v.shape[0]), int(v.shape[1])))
+    return min(cands) if cands else 0
+
+
+def build_model_from_state(sd: dict, n_cls: int | None = None,
+                           n_mask: int | None = None) -> PairRegNet:
     """Instantiate PairRegNet matching an old/new state dict.
 
-    Detection weights exist only in checkpoints trained with transient
-    detection; pose-only checkpoints get ``n_cls=0``. When detection weights
-    are present the class count is inferred from the head's output layer, so
-    both 3-class and 4-class checkpoints load correctly.
+    Detection/OB weights exist only in checkpoints trained with those heads;
+    pose-only checkpoints get ``n_cls=0, n_mask=0``.  When the heads are
+    present their sizes are inferred from the output layers, so 3/4-class and
+    1/2-channel-mask checkpoints all load correctly.
     """
-    inferred = 0
-    if any(k.startswith("det.") for k in sd.keys()):
-        cands = [int(v.shape[0]) for k, v in sd.items()
-                 if k.startswith("det.") and k.endswith("weight") and v.ndim == 4]
-        inferred = min(cands) if cands else 0
-    net = PairRegNet(n_cls=n_cls if n_cls is not None else inferred)
+    inferred_cls = _infer_head_out(sd, "det.")
+    inferred_mask = _infer_head_out(sd, "ob.")
+    net = PairRegNet(
+        n_cls=n_cls if n_cls is not None else inferred_cls,
+        n_mask=n_mask if n_mask is not None else inferred_mask,
+    )
     net.load_state_dict(sd)
     net.eval()
     return net

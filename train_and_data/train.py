@@ -230,7 +230,8 @@ _AUG_DIMS = {horizontal_flip: [2], vertical_flip: [1], rotate_180: [1, 2]}
 
 
 def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
-                 p_crop: float = 0.0, hmap: torch.Tensor | None = None):
+                 p_crop: float = 0.0, hmap: torch.Tensor | None = None,
+                 obmap: torch.Tensor | None = None):
     """Augment one (2, H, W) pair (+ its (4,) encoded target) on the CPU.
 
     ``crop``: fixed-size random-location crop applied identically to both
@@ -238,13 +239,15 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
     180 rotations flip the dx/dy/roll signs accordingly; photometric jitter
     and light noise are per channel/frame.
 
-    ``hmap``: optional per-class heatmap target (C, gy, gx) which is spatially
-    flipped *together* with the frames so transient GT stays consistent (crop
-    and heatmaps are mutually exclusive: only full-frame flips are supported).
-    Returns ``(pair, y)`` or ``(pair, y, hmap)``.
+    ``hmap`` (transient heatmap) and ``obmap`` (unusable-region mask) are
+    spatially flipped *together* with the frames so their GT stays consistent
+    (both use the same (C, gy, gx) layout). Crop and maps are mutually
+    exclusive: only full-frame flips are supported.  Always returns the
+    4-tuple ``(pair, y, hmap, obmap)`` with None where a map was not given.
     """
     h, w = pair.shape[1:]
-    if hmap is None and crop is not None and 0 < crop < h and np.random.rand() < p_crop:
+    if hmap is None and obmap is None and crop is not None and 0 < crop < h \
+            and np.random.rand() < p_crop:
         y0 = int(np.random.randint(0, h - crop + 1))
         x0 = int(np.random.randint(0, w - crop + 1))
         pair = pair[:, y0 : y0 + crop, x0 : x0 + crop]
@@ -254,6 +257,8 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
         pair, y = aug(pair, y)
         if hmap is not None:
             hmap = torch.flip(hmap, dims=_AUG_DIMS[aug])
+        if obmap is not None:
+            obmap = torch.flip(obmap, dims=_AUG_DIMS[aug])
     # photometric: per-image brightness/contrast jitter + slight noise
     for c in range(2):
         s = float(np.random.uniform(0.7, 1.3))
@@ -262,9 +267,7 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
             pair[c] = pair[c] + float(np.random.uniform(-0.03, 0.03))
         if np.random.rand() < 0.3:
             pair[c] = pair[c] + torch.randn_like(pair[c]) * 0.01
-    if hmap is not None:
-        return pair, y, hmap
-    return pair, y
+    return pair, y, hmap, obmap
 
 
 # ---------------------------------------------------------------------------
@@ -511,10 +514,35 @@ def fmt_det(d: dict) -> str:
             f" ({d['det_tp']}/{d['det_gt']})")
 
 
+class MaskLoss(nn.Module):
+    """BCE + soft-Dice on per-frame unusable-region masks (logits vs {0,1}).
+
+    ``pos_weight`` compensates for the class imbalance (usable pixels usually
+    outnumber OB/shaded ones); the Dice term stabilises the thin, band-like
+    positives.
+    """
+
+    def __init__(self, pos_weight: float = 2.0, dice_w: float = 1.0) -> None:
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor(float(pos_weight)))
+        self.dice_w = float(dice_w)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(
+            logits, target, pos_weight=self.pos_weight)
+        p = torch.sigmoid(logits)
+        dims = (0, 2, 3)
+        inter = (p * target).sum(dims)
+        denom = p.sum(dims) + target.sum(dims)
+        dice = 1.0 - (2.0 * inter + 1.0) / (denom + 1.0)
+        return bce + self.dice_w * dice.mean()
+
+
 @torch.no_grad()
 def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
              batch: int, scale: float = 1.0, det_gt: list | None = None,
-             det_scale: float = 1.0, det_n_cls: int = 4) -> dict:
+             det_scale: float = 1.0, det_n_cls: int = 4,
+             ob_targets: torch.Tensor | None = None) -> dict:
     """pairs: (N,2,H,W) preprocessed; lab: (N,3) [dx, dy, droll_deg].
 
     ``scale`` converts the model's pixel predictions (valid in the *model
@@ -523,14 +551,17 @@ def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
 
     If ``det_gt`` (per-sample list of (x, y, cls) native px) is given, peak
     detection metrics are computed as well (det peaks converted to native px
-    by ``det_scale``).
+    by ``det_scale``).  If ``ob_targets`` (N,2,grid,grid) is given, the mean
+    IoU of the predicted unusable-region mask is reported as ``ob_iou``.
     """
     model.eval()
     preds = []
     peaks_all: list | None = [] if det_gt is not None else None
+    ob_inter = 0.0
+    ob_union = 0.0
     for i in range(0, len(pairs), batch):
         pb = pairs[i : i + batch].to(device)
-        pose, det = model(pb)
+        pose, det, ob = model(pb)
         out = decode(pose)
         if scale != 1.0:
             out = out.clone()
@@ -544,10 +575,19 @@ def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
                     pk = [(cl, x * det_scale, y * det_scale, s)
                           for (cl, x, y, s) in pk]
                 peaks_all.append(pk)
+        if ob_targets is not None and ob is not None:
+            grid = int(ob_targets.shape[-1])
+            op = torch.sigmoid(F.adaptive_avg_pool2d(ob, (grid, grid)))
+            tgt = ob_targets[i : i + batch].to(op.device) > 0.5
+            predm = op > 0.5
+            ob_inter += float((predm & tgt).sum())
+            ob_union += float((predm | tgt).sum())
     pred = np.concatenate(preds, axis=0)
     m = metrics(pred, lab)
     if peaks_all is not None and det_gt is not None:
         m.update(det_metrics(peaks_all, det_gt, tol_px=scale * 8.0, n_cls=det_n_cls))
+    if ob_targets is not None:
+        m["ob_iou"] = ob_inter / max(1e-9, ob_union)
     return m
 
 
@@ -600,6 +640,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--det-neg-w", type=float, default=1.0,
                    help="weight of the hard-negative term in the detection "
                         "loss (lower = less background suppression)")
+    p.add_argument("--ob-w", type=float, default=0.5,
+                   help="weight of the unusable-region (optical black / shaded "
+                        "border) mask loss (0 disables the OB segmenter even if "
+                        "the data has mask GT)")
     p.add_argument("--max-train", type=int, default=0,
                    help="cap the number of train samples actually used "
                         "(0 = all); handy to smoke-test on a huge dataset")
@@ -663,7 +707,14 @@ def main() -> None:
     zero = np.zeros_like(lab)
     print("baseline (predict dx=dy=roll=0):", fmt(metrics(zero, lab)))
 
-    # ---- transient detection setup (native mode only) ----------------------
+    # ---- shared metadata (native mode only) --------------------------------
+    # Both the transient head and the OB segmenter need native-resolution GT,
+    # which is only available without ROI resampling / cropping.
+    meta_ok = (not roi_active and args.crop <= 0
+               and (args.data / "train_meta.npz").exists())
+    ztrain = np.load(args.data / "train_meta.npz") if meta_ok else None
+
+    # ---- transient detection setup -----------------------------------------
     det_active = False
     n_cls = 0
     det_w = 0.0
@@ -676,9 +727,8 @@ def main() -> None:
     tr_tn = tr_tx = tr_ty = tr_tc = None
     tr_sn = tr_sx = tr_sy = None
 
-    if (args.det_w > 0 and not roi_active and args.crop <= 0
-            and (args.data / "train_meta.npz").exists()):
-        zt = np.load(args.data / "train_meta.npz")
+    if args.det_w > 0 and ztrain is not None:
+        zt = ztrain
         if "trans_n" in zt.files or "sat_n" in zt.files:
             det_active = True
             has_sat = "sat_n" in zt.files
@@ -726,8 +776,34 @@ def main() -> None:
     if det_active:
         print(f"transient detection on: {n_cls} classes, heat grid {grid}")
 
+    # ---- unusable-region (optical black / shaded border) segmenter ----------
+    ob_active = False
+    n_mask = 0
+    ob_w = 0.0
+    ob_loss = None
+    tr_ob = val_ob = test_ob = None
+    ob_grid = grid
+    if args.ob_w > 0 and ztrain is not None and "ob_a" in ztrain.files:
+        ob_active = True
+        n_mask = 2
+        ob_w = float(args.ob_w)
+        if "ob_grid" in ztrain.files:
+            ob_grid = int(ztrain["ob_grid"])
+
+        def _stack_ob(z, nn: int) -> torch.Tensor:
+            a = np.asarray(z["ob_a"])[:nn].astype(np.float32)
+            b = np.asarray(z["ob_b"])[:nn].astype(np.float32)
+            return torch.from_numpy(np.stack([a, b], axis=1))  # (N,2,grid,grid)
+
+        tr_ob = _stack_ob(ztrain, n)
+        val_ob = _stack_ob(np.load(args.data / "val_meta.npz"), len(va_y))
+        test_ob = _stack_ob(np.load(args.data / "test_meta.npz"), len(te_y))
+        ob_loss = MaskLoss()
+    if ob_active:
+        print(f"OB/unusable-region segmenter on: {n_mask} channels, grid {ob_grid}")
+
     crop = args.crop if 0 < args.crop < dst else None
-    model = PairRegNet(n_cls=n_cls).to(device)
+    model = PairRegNet(n_cls=n_cls, n_mask=n_mask).to(device)
     if args.resume is not None:
         robj = torch.load(args.resume, map_location=device)
         rsd = robj["model"] if isinstance(robj, dict) and "model" in robj else robj
@@ -738,9 +814,10 @@ def main() -> None:
               f"unused {len(unexpected)})")
     if args.freeze_pose:
         for name, param in model.named_parameters():
-            param.requires_grad = name.startswith("det.")
+            param.requires_grad = (name.startswith("det.")
+                                   or name.startswith("ob."))
         nf = sum(1 for p in model.parameters() if not p.requires_grad)
-        print(f"froze {nf} parameter tensors outside the detection head")
+        print(f"froze {nf} parameter tensors outside the detection/OB heads")
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=1e-5)
@@ -754,11 +831,14 @@ def main() -> None:
         tot_loss = 0.0
         tot_reg = 0.0
         tot_det = 0.0
+        tot_ob = 0.0
         nb = 0
         for i in range(0, n, args.batch):
             idx = order[i : i + args.batch]
+            idx_t = torch.from_numpy(np.asarray(idx, dtype=np.int64))
             pb = torch.from_numpy(fetch_norm_batch(tr_a, tr_b, tr_norm, idx))
-            yb = train_ys[torch.from_numpy(np.asarray(idx, dtype=np.int64))].clone()
+            yb = train_ys[idx_t].clone()
+            ob_b = tr_ob[idx_t] if ob_active else None
             hb_raw = None
             if det_active:
                 meta_b = {}
@@ -769,48 +849,65 @@ def main() -> None:
                     meta_b.update({"sat_n": tr_sn[idx], "sat_x": tr_sx[idx],
                                    "sat_y": tr_sy[idx]})
                 hb_raw = build_heat_targets(meta_b, len(idx), grid, n_cls=n_cls)
-            pairs, ys, hmaps = [], [], []
+                if ob_b is not None and hb_raw is not None:
+                    # Drop transient GT that falls inside the (per-frame,
+                    # possibly A/B-disjoint) unusable border: the source is
+                    # physically shielded, so a positive label there is a
+                    # poisoned target. Turn it into background.
+                    unusable = ob_b.sum(dim=1) > 0          # (B, grid, grid)
+                    hb_raw = hb_raw * (~unusable).unsqueeze(1).to(hb_raw.dtype)
+            pairs, ys, hmaps, obmaps = [], [], [], []
             for j in range(len(pb)):
                 p, y = pb[j], yb[j]
                 hj = hb_raw[j] if hb_raw is not None else None
+                oj = ob_b[j] if ob_b is not None else None
                 if roi_active:
                     p, y = roisample_pair(p, y, src, dst,
                                           args.roi_min, min(args.roi_max, src))
-                out3 = augment_pair(p, y, crop=crop,
-                                    p_crop=1.0 if crop else 0.0, hmap=hj)
+                p, y, hj, oj = augment_pair(p, y, crop=crop,
+                                            p_crop=1.0 if crop else 0.0,
+                                            hmap=hj, obmap=oj)
                 if hj is not None:
-                    p, y, hj = out3
                     hmaps.append(hj)
-                else:
-                    p, y = out3
+                if oj is not None:
+                    obmaps.append(oj)
                 pairs.append(p)
                 ys.append(y)
             pb = torch.stack(pairs).to(device)
             yb = torch.stack(ys).to(device)
             opt.zero_grad()
-            pose, det = model(pb)
+            pose, det, ob = model(pb)
             rloss = regression_loss(pose, yb)
             loss = rloss
             dl = None
             if det_active and det is not None:
                 dl = det_loss(det, torch.stack(hmaps).to(device))
                 loss = loss + det_w * dl
+            ol = None
+            if ob_active and ob is not None and obmaps:
+                ol = ob_loss(F.adaptive_avg_pool2d(ob, (ob_grid, ob_grid)),
+                             torch.stack(obmaps).to(device))
+                loss = loss + ob_w * ol
             loss.backward()
             opt.step()
             tot_loss += float(loss) * len(pb)
             tot_reg += float(rloss) * len(pb)
             if dl is not None:
                 tot_det += float(dl) * len(pb)
+            if ol is not None:
+                tot_ob += float(ol) * len(pb)
             nb += len(pb)
         sched.step()
         vm = evaluate(model, val_pairs, va_y, device, args.batch,
                       scale=metric_scale, det_gt=val_det_gt if det_active else None,
-                      det_n_cls=n_cls)
+                      det_n_cls=n_cls,
+                      ob_targets=val_ob if ob_active else None)
         det_str = fmt_det(vm) if det_active else ""
+        ob_str = f"ob {1.0 - vm['ob_iou']:.3f}" if ob_active else ""
         print(
             f"ep {ep + 1:02d}/{args.epochs}  loss {tot_loss / nb:.4f}  "
             f"lr {sched.get_last_lr()[0]:.1e}  ({time.perf_counter() - t_ep:.0f}s)  "
-            f"val: {fmt(vm)}  {det_str}"
+            f"val: {fmt(vm)}  {det_str}  {ob_str}"
         )
         score = vm["med_mag"] + 0.25 * vm["med_roll"]
         if best is None or score < best[0]:
@@ -828,18 +925,23 @@ def main() -> None:
         raise RuntimeError("no epoch ran")
     _, ep_best, vm_best = best
     print(f"\nbest val at epoch {ep_best + 1}: {fmt(vm_best)}"
-          + (f"  {fmt_det(vm_best)}" if det_active else ""))
+          + (f"  {fmt_det(vm_best)}" if det_active else "")
+          + (f"  ob IoU {vm_best['ob_iou']:.3f}" if ob_active else ""))
 
     model.load_state_dict(torch.load(args.model_dir / "best.pt"))
-    for split, pairs, labn, dgt in (
-        ("val", val_pairs, va_y, val_det_gt if det_active else None),
-        ("test", test_pairs, te_y, test_det_gt if det_active else None),
+    for split, pairs, labn, dgt, obt in (
+        ("val", val_pairs, va_y, val_det_gt if det_active else None,
+         val_ob if ob_active else None),
+        ("test", test_pairs, te_y, test_det_gt if det_active else None,
+         test_ob if ob_active else None),
     ):
         m = evaluate(model, pairs, labn, device, args.batch, scale=metric_scale,
-                     det_gt=dgt, det_n_cls=n_cls)
+                     det_gt=dgt, det_n_cls=n_cls, ob_targets=obt)
         line = f"{split} final: {fmt(m)}"
         if dgt is not None:
             line += f"  {fmt_det(m)}"
+        if obt is not None:
+            line += f"  ob IoU {m['ob_iou']:.3f}"
         print(line)
 
     with (args.model_dir / "train_summary.json").open("w") as f:
@@ -852,6 +954,8 @@ def main() -> None:
                 "metric_scale": metric_scale,
                 "det_classes": n_cls,
                 "det_weight": det_w,
+                "ob_channels": n_mask,
+                "ob_weight": ob_w,
                 "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             },
             f,

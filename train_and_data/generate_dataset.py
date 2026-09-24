@@ -68,6 +68,9 @@ DEFAULT_CATALOG = HERE.parent / "data" / "hip_catalog.csv"
 # luminance weights used when storing the RGB (H, W, 3) frames as grayscale
 _LUM = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
+#: downsampling of the OB/unusable-region mask GT (matches model.DET_STRIDE)
+MASK_STRIDE = 4
+
 # transient-source bookkeeping
 MAX_TRANSIENTS = 8                     # point sources per pair stored in *_meta.npz
 MAX_SAT_POINTS = 96                    # satellite-trail GT points per pair
@@ -99,6 +102,41 @@ def _tangent_to_px(x: float, y: float, fov: float, size: int) -> tuple[float, fl
     px = ((x + half) / (2.0 * half)) * (size - 1)
     py = ((half - y) / (2.0 * half)) * (size - 1)
     return float(px), float(py)
+
+
+def framing_mask(framing: dict, size: int, grid: int) -> np.ndarray:
+    """Binary unusable-border mask for one exposure at ``grid`` resolution.
+
+    1 = optical-black (shielded) or structurally-shaded border; 0 = usable
+    pixels.  Combines the OB and shading band widths per side (the frame is a
+    crop of a larger sensor, so at most two adjacent borders are ever set).
+    Coordinates are produced on a ``grid x grid`` lattice (native px / stride),
+    matching the model's OB segmenter output.
+    """
+    mask = np.zeros((grid, grid), dtype=np.uint8)
+    stride = size / max(1, grid)
+
+    def cells(width_px: int) -> int:
+        return min(grid, int(math.ceil(width_px / stride))) if width_px > 0 else 0
+
+    for side in ("top", "bottom", "left", "right"):
+        w_px = 0
+        if framing.get("optical_black"):
+            w_px = max(w_px, int(framing.get(f"ob_{side}", 0)))
+        if framing.get("shading"):
+            w_px = max(w_px, int(framing.get(f"shading_{side}", 0)))
+        n = cells(w_px)
+        if n <= 0:
+            continue
+        if side == "top":
+            mask[:n, :] = 1
+        elif side == "bottom":
+            mask[grid - n:, :] = 1
+        elif side == "left":
+            mask[:, :n] = 1
+        else:
+            mask[:, grid - n:] = 1
+    return mask
 
 
 def gnomonic_inverse_pt(x: float, y: float, ra0_deg: float, dec0_deg: float):
@@ -517,6 +555,10 @@ class PairSampler:
             "bg_a": float(art_a["bg_level"]),
             "bg_b": float(art_b["bg_level"]),
         }
+        # unusable-region masks (optical black + shaded borders), one per frame
+        grid = max(1, size // MASK_STRIDE)
+        rec["ob_a"] = framing_mask(art_a, size, grid)
+        rec["ob_b"] = framing_mask(art_b, size, grid)
         if trans is not None:
             rec["gt_trans"] = trans["gt"]     # (K, 3) pxB_x, pxB_y, cls
         if sats is not None:
@@ -817,6 +859,11 @@ def run_split(
     meta["sat_y"] = np.full((count, MAX_SAT_POINTS), -1.0)
     meta["bg_a"] = np.zeros(count)
     meta["bg_b"] = np.zeros(count)
+    # unusable-region masks (stride-4 lattice): 1 = optical black / shaded
+    grid = max(1, size // MASK_STRIDE)
+    meta["ob_grid"] = np.asarray(grid, dtype=np.int32)
+    meta["ob_a"] = np.zeros((count, grid, grid), dtype=np.uint8)
+    meta["ob_b"] = np.zeros((count, grid, grid), dtype=np.uint8)
     seed = sampler.args.seed + 10_000_000 * (0 if split == "train" else 1)
 
     for i in range(count):
@@ -838,6 +885,8 @@ def run_split(
         meta["stars_b"][i] = rec["stars_b"]
         meta["bg_a"][i] = rec.get("bg_a", 0.0)
         meta["bg_b"][i] = rec.get("bg_b", 0.0)
+        meta["ob_a"][i] = rec["ob_a"]
+        meta["ob_b"][i] = rec["ob_b"]
         gt = rec.get("gt_trans")
         if gt is not None and len(gt):
             k = min(len(gt), MAX_TRANSIENTS)

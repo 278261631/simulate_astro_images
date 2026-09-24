@@ -553,7 +553,7 @@ class EvalWorker(QThread):
                     if self.isInterruptionRequested():
                         return
                     en = min(st + self.batch, n)
-                    pose, det = self.net(pairs[st:en])
+                    pose, det, _ob = self.net(pairs[st:en])
                     out = decode(pose).numpy()
                     pred[st:en] = out
                     if det is not None:
