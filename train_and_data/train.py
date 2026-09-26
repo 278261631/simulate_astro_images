@@ -39,8 +39,13 @@ from model import (  # noqa: E402
     preprocess,
 )
 
-#: class index of the satellite trail (appear=0, satellite=1)
+#: class index of the satellite trail in the *mask* head's channel layout
+#: (appear is the only detection class now; satellite is segmented)
 SAT_CLS = 1
+
+#: channel groups of the region-segmentation head:
+#: [0] A-frame unusable (OB/shaded), [1] B-frame unusable, [2] B-frame satellite
+MASK_GROUPS = {"ob": [0, 1], "sat": [2]}
 
 
 def set_seed(seed: int) -> None:
@@ -231,7 +236,8 @@ _AUG_DIMS = {horizontal_flip: [2], vertical_flip: [1], rotate_180: [1, 2]}
 
 def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
                  p_crop: float = 0.0, hmap: torch.Tensor | None = None,
-                 obmap: torch.Tensor | None = None):
+                 obmap: torch.Tensor | None = None,
+                 smap: torch.Tensor | None = None):
     """Augment one (2, H, W) pair (+ its (4,) encoded target) on the CPU.
 
     ``crop``: fixed-size random-location crop applied identically to both
@@ -239,15 +245,16 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
     180 rotations flip the dx/dy/roll signs accordingly; photometric jitter
     and light noise are per channel/frame.
 
-    ``hmap`` (transient heatmap) and ``obmap`` (unusable-region mask) are
-    spatially flipped *together* with the frames so their GT stays consistent
-    (both use the same (C, gy, gx) layout). Crop and maps are mutually
-    exclusive: only full-frame flips are supported.  Always returns the
-    4-tuple ``(pair, y, hmap, obmap)`` with None where a map was not given.
+    ``hmap`` (transient heatmap), ``obmap`` (region mask) and ``smap`` (size
+    regression target) are spatially flipped *together* with the frames so
+    their GT stays consistent (all use the same (C, gy, gx) layout).  Crop and
+    maps are mutually exclusive: only full-frame flips are supported.  Always
+    returns the 5-tuple ``(pair, y, hmap, obmap, smap)`` with None where a map
+    was not given.
     """
     h, w = pair.shape[1:]
-    if hmap is None and obmap is None and crop is not None and 0 < crop < h \
-            and np.random.rand() < p_crop:
+    if hmap is None and obmap is None and smap is None and crop is not None \
+            and 0 < crop < h and np.random.rand() < p_crop:
         y0 = int(np.random.randint(0, h - crop + 1))
         x0 = int(np.random.randint(0, w - crop + 1))
         pair = pair[:, y0 : y0 + crop, x0 : x0 + crop]
@@ -259,6 +266,8 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
             hmap = torch.flip(hmap, dims=_AUG_DIMS[aug])
         if obmap is not None:
             obmap = torch.flip(obmap, dims=_AUG_DIMS[aug])
+        if smap is not None:
+            smap = torch.flip(smap, dims=_AUG_DIMS[aug])
     # photometric: per-image brightness/contrast jitter + slight noise
     for c in range(2):
         s = float(np.random.uniform(0.7, 1.3))
@@ -267,7 +276,7 @@ def augment_pair(pair: torch.Tensor, y: torch.Tensor, crop: int | None = None,
             pair[c] = pair[c] + float(np.random.uniform(-0.03, 0.03))
         if np.random.rand() < 0.3:
             pair[c] = pair[c] + torch.randn_like(pair[c]) * 0.01
-    return pair, y, hmap, obmap
+    return pair, y, hmap, obmap, smap
 
 
 # ---------------------------------------------------------------------------
@@ -341,23 +350,21 @@ def fmt(m: dict) -> str:
 
 
 def build_heat_targets(meta: dict, n: int, grid: int, sigma: float = 1.2,
-                       n_cls: int = 4) -> torch.Tensor | None:
+                       n_cls: int = 1) -> torch.Tensor | None:
     """(n, C, grid, grid) int8 target tensor from meta GT arrays.
 
     CenterNet-style supervision: +1 at each source centre cell (radius ~1),
-    -1 in the ignore ring around it, 0 elsewhere.  Point transients
-    (appear) come from ``trans_*``; satellite trails are stored as
-    multiple centreline points (class 3) in ``sat_*``.
+    -1 in the ignore ring around it, 0 elsewhere.  Only the point transient
+    (appear, class 0) is a detection target; satellite trails are *not*
+    stamped here -- they are supervised as a segmentation mask instead
+    (see ``build_sat_mask``), so the detection head stays single-class.
     """
-    if "trans_n" not in meta and "sat_n" not in meta:
+    if "trans_n" not in meta:
         return None
-    tn = np.asarray(meta["trans_n"], dtype=np.int64)[:n] if "trans_n" in meta else np.zeros(n, np.int64)
+    tn = np.asarray(meta["trans_n"], dtype=np.int64)[:n]
     tx = np.asarray(meta["trans_x"]) if "trans_x" in meta else np.zeros((n, 1))
     ty = np.asarray(meta["trans_y"]) if "trans_y" in meta else np.zeros((n, 1))
     tc = np.asarray(meta["trans_cls"]) if "trans_cls" in meta else np.zeros((n, 1))
-    sn = np.asarray(meta["sat_n"], dtype=np.int64)[:n] if "sat_n" in meta else np.zeros(n, np.int64)
-    sx = np.asarray(meta["sat_x"]) if "sat_x" in meta else np.zeros((n, 1))
-    sy = np.asarray(meta["sat_y"]) if "sat_y" in meta else np.zeros((n, 1))
     out = np.zeros((n, n_cls, grid, grid), dtype=np.int8)
 
     def stamp(i: int, cl: int, cx: float, cy: float) -> None:
@@ -381,12 +388,57 @@ def build_heat_targets(meta: dict, n: int, grid: int, sigma: float = 1.2,
                 break
             stamp(i, int(round(float(tc[i, j]))),
                   float(tx[i, j]) / DET_STRIDE, float(ty[i, j]) / DET_STRIDE)
-        for j in range(int(sn[i])):
-            if j >= sx.shape[1]:
-                break
-            stamp(i, SAT_CLS, float(sx[i, j]) / DET_STRIDE,
-                  float(sy[i, j]) / DET_STRIDE)
     return torch.as_tensor(out)
+
+
+def build_size_targets(meta: dict, n: int, grid: int, n_cls: int = 1
+                       ) -> torch.Tensor | None:
+    """(n, C, grid, grid) float target: apparent FWHM (px) at each GT centre.
+
+    Value only at the positive cell of each transient (0 elsewhere); multiply
+    by the heat-target positive mask in the loss.
+    """
+    if "trans_size" not in meta:
+        return None
+    tn = np.asarray(meta["trans_n"], dtype=np.int64)[:n]
+    tx = np.asarray(meta["trans_x"])
+    ty = np.asarray(meta["trans_y"])
+    tc = np.asarray(meta["trans_cls"])
+    ts = np.asarray(meta["trans_size"])
+    out = np.zeros((n, n_cls, grid, grid), dtype=np.float32)
+    for i in range(n):
+        for j in range(int(tn[i])):
+            cl = int(round(float(tc[i, j])))
+            cx, cy = float(tx[i, j]) / DET_STRIDE, float(ty[i, j]) / DET_STRIDE
+            xi, yi = int(round(cx)), int(round(cy))
+            if 0 <= cl < n_cls and 0 <= xi < grid and 0 <= yi < grid \
+                    and ts[i, j] >= 0.0:
+                out[i, cl, yi, xi] = float(ts[i, j])
+    return torch.as_tensor(out)
+
+
+def build_sat_mask(sx: np.ndarray, sy: np.ndarray, sn: np.ndarray, n: int,
+                   grid: int, size: int, radius: int = 1) -> np.ndarray:
+    """Rasterise satellite centreline points (native B-frame px) to (n,grid,grid).
+
+    Each centreline point is a small disk (``radius`` cells) so the ~8 px point
+    spacing becomes a connected trail on the coarse mask lattice.  1 = trail.
+    """
+    m = np.zeros((n, grid, grid), dtype=np.float32)
+    scale = grid / float(size)
+    for i in range(n):
+        for j in range(int(sn[i])):
+            x = float(sx[i, j]) * scale
+            y = float(sy[i, j]) * scale
+            if x < 0.0 or y < 0.0:
+                continue
+            cx, cy = int(round(x)), int(round(y))
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    xx, yy = cx + dx, cy + dy
+                    if 0 <= xx < grid and 0 <= yy < grid:
+                        m[i, yy, xx] = 1.0
+    return m
 
 
 class TransientHeatLoss(nn.Module):
@@ -430,28 +482,30 @@ class TransientHeatLoss(nn.Module):
 
 
 def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
-                n_cls: int = 3, sat_cls: int = SAT_CLS,
+                n_cls: int = 1, sat_cls: int | None = None,
                 sat_radius: float = 24.0) -> dict | None:
     """Peak-matching precision / recall per class.
 
-    Point classes (appear) are matched one-to-one.  Satellite GT is
-    stored as many centreline points; those are clustered into trail
-    *instances* and a hit on any point detects the whole trail (so recall is
-    not diluted by trail length).
+    Point classes (appear) are matched one-to-one.  ``sat_cls`` is optional:
+    when given (and < ``n_cls``) satellite GT -- stored as many centreline
+    points -- is clustered into trail *instances* and a hit on any point
+    detects the whole trail.  With satellites handled by a segmentation head
+    this is normally left ``None``.
     """
     n = len(model_pred_peaks)
+    has_sat = sat_cls is not None and 0 <= int(sat_cls) < n_cls
     tp = np.zeros(n_cls); fp = np.zeros(n_cls); fn = np.zeros(n_cls)
     for i in range(n):
         gts = [(float(g[0]), float(g[1]), int(g[2])) for g in gt[i]]
         used_g = set()
-        sat_pts = [(g[0], g[1]) for g in gts if g[2] == sat_cls]
+        sat_pts = [(g[0], g[1]) for g in gts if has_sat and g[2] == sat_cls]
         sat_inst = cluster_points(sat_pts, sat_radius) if sat_pts else []
         matched_inst: set[int] = set()
         # cluster_points returns indices into sat_pts; keep mapping for points
-        sat_origin = [(g[0], g[1]) for g in gts if g[2] == sat_cls]
+        sat_origin = list(sat_pts)
 
         for (cl, x, y, s) in model_pred_peaks[i]:
-            if cl == sat_cls:
+            if has_sat and cl == sat_cls:
                 hit = None
                 for ii, grp in enumerate(sat_inst):
                     for k in grp:
@@ -469,6 +523,8 @@ def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
                 # duplicate detection on an already-found trail: ignored
                 continue
             # point classes
+            if cl < 0 or cl >= n_cls:
+                continue
             best = None
             for gi, (gx, gy, gcl) in enumerate(gts):
                 if gi in used_g or gcl != cl:
@@ -483,11 +539,14 @@ def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
                 fp[cl] += 1
         # misses
         for gi, (gx, gy, gcl) in enumerate(gts):
-            if gcl == sat_cls:
+            if has_sat and gcl == sat_cls:
+                continue
+            if gcl < 0 or gcl >= n_cls:
                 continue
             if gi not in used_g:
                 fn[gcl] += 1
-        fn[sat_cls] += len(sat_inst) - len(matched_inst)
+        if has_sat:
+            fn[sat_cls] += len(sat_inst) - len(matched_inst)
 
     tot_g = int(tp.sum() + fn.sum())
     tot_p = int(tp.sum() + fp.sum())
@@ -541,8 +600,11 @@ class MaskLoss(nn.Module):
 @torch.no_grad()
 def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
              batch: int, scale: float = 1.0, det_gt: list | None = None,
-             det_scale: float = 1.0, det_n_cls: int = 4,
-             ob_targets: torch.Tensor | None = None) -> dict:
+             det_scale: float = 1.0, det_n_cls: int = 1,
+             ob_targets: torch.Tensor | None = None,
+             mask_groups: dict | None = None,
+             size_targets: torch.Tensor | None = None,
+             size_scale: float = 1.0) -> dict:
     """pairs: (N,2,H,W) preprocessed; lab: (N,3) [dx, dy, droll_deg].
 
     ``scale`` converts the model's pixel predictions (valid in the *model
@@ -551,17 +613,22 @@ def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
 
     If ``det_gt`` (per-sample list of (x, y, cls) native px) is given, peak
     detection metrics are computed as well (det peaks converted to native px
-    by ``det_scale``).  If ``ob_targets`` (N,2,grid,grid) is given, the mean
-    IoU of the predicted unusable-region mask is reported as ``ob_iou``.
+    by ``det_scale``).  If ``ob_targets`` (N,C,grid,grid) is given, ``mask_groups``
+    maps a name to channel indices (e.g. {"ob": [0, 1], "sat": [2]}) and each
+    group's mean IoU is reported as ``<name>_iou``.
     """
     model.eval()
     preds = []
     peaks_all: list | None = [] if det_gt is not None else None
-    ob_inter = 0.0
-    ob_union = 0.0
+    groups = mask_groups or ({"ob": list(range(ob_targets.shape[1]))}
+                             if ob_targets is not None else {})
+    g_inter = {k: 0.0 for k in groups}
+    g_union = {k: 0.0 for k in groups}
+    size_abs = 0.0
+    size_cnt = 0
     for i in range(0, len(pairs), batch):
         pb = pairs[i : i + batch].to(device)
-        pose, det, ob = model(pb)
+        pose, det, ob, size = model(pb)
         out = decode(pose)
         if scale != 1.0:
             out = out.clone()
@@ -580,14 +647,25 @@ def evaluate(model: nn.Module, pairs: torch.Tensor, lab: np.ndarray, device,
             op = torch.sigmoid(F.adaptive_avg_pool2d(ob, (grid, grid)))
             tgt = ob_targets[i : i + batch].to(op.device) > 0.5
             predm = op > 0.5
-            ob_inter += float((predm & tgt).sum())
-            ob_union += float((predm | tgt).sum())
+            for name, chans in groups.items():
+                for c in chans:
+                    g_inter[name] += float((predm[:, c] & tgt[:, c]).sum())
+                    g_union[name] += float((predm[:, c] | tgt[:, c]).sum())
+        if size_targets is not None and size is not None:
+            st = size_targets[i : i + batch].to(size.device)
+            pos = st > 0.0
+            if pos.any():
+                psz = torch.exp(size) * size_scale            # (B,C,gh,gw)
+                size_abs += float((psz[pos] - st[pos]).abs().sum())
+                size_cnt += int(pos.sum())
     pred = np.concatenate(preds, axis=0)
     m = metrics(pred, lab)
     if peaks_all is not None and det_gt is not None:
         m.update(det_metrics(peaks_all, det_gt, tol_px=scale * 8.0, n_cls=det_n_cls))
-    if ob_targets is not None:
-        m["ob_iou"] = ob_inter / max(1e-9, ob_union)
+    for name in groups:
+        m[f"{name}_iou"] = g_inter[name] / max(1e-9, g_union[name])
+    if size_targets is not None:
+        m["size_mae"] = size_abs / max(1, size_cnt)
     return m
 
 
@@ -644,6 +722,10 @@ def parse_args() -> argparse.Namespace:
                    help="weight of the unusable-region (optical black / shaded "
                         "border) mask loss (0 disables the OB segmenter even if "
                         "the data has mask GT)")
+    p.add_argument("--size-w", type=float, default=0.5,
+                   help="weight of the per-detection size (apparent FWHM, px) "
+                        "regression loss (0 disables the size head even if the "
+                        "data has trans_size)")
     p.add_argument("--max-train", type=int, default=0,
                    help="cap the number of train samples actually used "
                         "(0 = all); handy to smoke-test on a huge dataset")
@@ -726,36 +808,42 @@ def main() -> None:
     test_det_targets = None
     tr_tn = tr_tx = tr_ty = tr_tc = None
     tr_sn = tr_sx = tr_sy = None
+    size_active = False
+    n_size = 0
+    size_w = 0.0
+    tr_ts = None
+    val_size = test_size = None
 
     if args.det_w > 0 and ztrain is not None:
         zt = ztrain
-        if "trans_n" in zt.files or "sat_n" in zt.files:
+        if "trans_n" in zt.files:
             det_active = True
-            has_sat = "sat_n" in zt.files
             cls_max = -1
-            if "trans_cls" in zt.files and "trans_n" in zt.files:
-                tn_ = np.asarray(zt["trans_n"])
-                tc_ = np.asarray(zt["trans_cls"])
-                valid = [int(round(tc_[i, j])) for i in range(len(tn_))
-                         for j in range(int(tn_[i]))]
-                cls_max = max(valid) if valid else -1
-            n_cls = max(cls_max + 1, (SAT_CLS + 1) if has_sat else 0, 1)
+            tn_ = np.asarray(zt["trans_n"])
+            tc_ = np.asarray(zt["trans_cls"])
+            valid = [int(round(tc_[i, j])) for i in range(len(tn_))
+                     for j in range(int(tn_[i]))]
+            cls_max = max(valid) if valid else -1
+            n_cls = max(cls_max + 1, 1)          # appear only; satellite = mask
             det_w = float(args.det_w)
-            tr_tn = np.asarray(zt["trans_n"]) if "trans_n" in zt.files else None
-            tr_tx = np.asarray(zt["trans_x"]) if "trans_x" in zt.files else None
-            tr_ty = np.asarray(zt["trans_y"]) if "trans_y" in zt.files else None
-            tr_tc = np.asarray(zt["trans_cls"]) if "trans_cls" in zt.files else None
-            tr_sn = np.asarray(zt["sat_n"]) if has_sat else None
-            tr_sx = np.asarray(zt["sat_x"]) if has_sat else None
-            tr_sy = np.asarray(zt["sat_y"]) if has_sat else None
+            tr_tn = np.asarray(zt["trans_n"])
+            tr_tx = np.asarray(zt["trans_x"])
+            tr_ty = np.asarray(zt["trans_y"])
+            tr_tc = np.asarray(zt["trans_cls"])
             det_loss = TransientHeatLoss(neg_w=float(args.det_neg_w))
+            # per-detection size regression (apparent FWHM) is optional
+            if args.size_w > 0 and "trans_size" in zt.files:
+                size_active = True
+                n_size = n_cls
+                size_w = float(args.size_w)
+                tr_ts = np.asarray(zt["trans_size"])
 
             def _load_trans_gt(path: Path, nn: int):
                 zp = np.load(path)
-                arr = {k: np.asarray(zp[k]) for k in zp.files
-                       if k in ("trans_n", "trans_x", "trans_y", "trans_cls",
-                                "sat_n", "sat_x", "sat_y")}
+                keys = ("trans_n", "trans_x", "trans_y", "trans_cls", "trans_size")
+                arr = {k: np.asarray(zp[k]) for k in zp.files if k in keys}
                 tgt = build_heat_targets(arr, nn, grid, n_cls=n_cls)
+                sz = build_size_targets(arr, nn, grid, n_cls=n_cls)
                 gt = []
                 for i in range(nn):
                     row = []
@@ -763,20 +851,18 @@ def main() -> None:
                         row.append((float(arr["trans_x"][i, j]),
                                     float(arr["trans_y"][i, j]),
                                     int(round(float(arr["trans_cls"][i, j])))))
-                    for j in range(int(arr.get("sat_n", np.zeros(nn))[i])):
-                        row.append((float(arr["sat_x"][i, j]),
-                                    float(arr["sat_y"][i, j]), SAT_CLS))
                     gt.append(row)
-                return tgt, gt
+                return tgt, gt, sz
 
-            val_det_targets, val_det_gt = _load_trans_gt(
+            val_det_targets, val_det_gt, val_size = _load_trans_gt(
                 args.data / "val_meta.npz", len(va_y))
-            test_det_targets, test_det_gt = _load_trans_gt(
+            test_det_targets, test_det_gt, test_size = _load_trans_gt(
                 args.data / "test_meta.npz", len(te_y))
     if det_active:
-        print(f"transient detection on: {n_cls} classes, heat grid {grid}")
+        print(f"transient detection on: {n_cls} class(es), heat grid {grid}"
+              + (f", size regression" if size_active else ""))
 
-    # ---- unusable-region (optical black / shaded border) segmenter ----------
+    # ---- region segmenter: [A-unusable, B-unusable, B-satellite] -----------
     ob_active = False
     n_mask = 0
     ob_w = 0.0
@@ -785,7 +871,7 @@ def main() -> None:
     ob_grid = grid
     if args.ob_w > 0 and ztrain is not None and "ob_a" in ztrain.files:
         ob_active = True
-        n_mask = 2
+        n_mask = 3
         ob_w = float(args.ob_w)
         if "ob_grid" in ztrain.files:
             ob_grid = int(ztrain["ob_grid"])
@@ -793,7 +879,14 @@ def main() -> None:
         def _stack_ob(z, nn: int) -> torch.Tensor:
             a = np.asarray(z["ob_a"])[:nn].astype(np.float32)
             b = np.asarray(z["ob_b"])[:nn].astype(np.float32)
-            return torch.from_numpy(np.stack([a, b], axis=1))  # (N,2,grid,grid)
+            sat = build_sat_mask(
+                np.asarray(z["sat_x"]) if "sat_x" in z.files else np.zeros((nn, 1)),
+                np.asarray(z["sat_y"]) if "sat_y" in z.files else np.zeros((nn, 1)),
+                np.asarray(z["sat_n"], dtype=np.int64) if "sat_n" in z.files
+                else np.zeros(nn, np.int64),
+                nn, ob_grid, src)
+            return torch.from_numpy(
+                np.stack([a, b, sat], axis=1))   # (N,3,grid,grid)
 
         tr_ob = _stack_ob(ztrain, n)
         val_ob = _stack_ob(np.load(args.data / "val_meta.npz"), len(va_y))
@@ -803,7 +896,7 @@ def main() -> None:
         print(f"OB/unusable-region segmenter on: {n_mask} channels, grid {ob_grid}")
 
     crop = args.crop if 0 < args.crop < dst else None
-    model = PairRegNet(n_cls=n_cls, n_mask=n_mask).to(device)
+    model = PairRegNet(n_cls=n_cls, n_mask=n_mask, n_size=n_size).to(device)
     if args.resume is not None:
         robj = torch.load(args.resume, map_location=device)
         rsd = robj["model"] if isinstance(robj, dict) and "model" in robj else robj
@@ -832,6 +925,7 @@ def main() -> None:
         tot_reg = 0.0
         tot_det = 0.0
         tot_ob = 0.0
+        tot_sz = 0.0
         nb = 0
         for i in range(0, n, args.batch):
             idx = order[i : i + args.batch]
@@ -840,43 +934,51 @@ def main() -> None:
             yb = train_ys[idx_t].clone()
             ob_b = tr_ob[idx_t] if ob_active else None
             hb_raw = None
+            sb_raw = None
             if det_active:
                 meta_b = {}
                 if tr_tn is not None:
                     meta_b.update({"trans_n": tr_tn[idx], "trans_x": tr_tx[idx],
                                    "trans_y": tr_ty[idx], "trans_cls": tr_tc[idx]})
-                if tr_sn is not None:
-                    meta_b.update({"sat_n": tr_sn[idx], "sat_x": tr_sx[idx],
-                                   "sat_y": tr_sy[idx]})
+                if size_active and tr_ts is not None:
+                    meta_b["trans_size"] = tr_ts[idx]
                 hb_raw = build_heat_targets(meta_b, len(idx), grid, n_cls=n_cls)
+                if size_active:
+                    sb_raw = build_size_targets(meta_b, len(idx), grid, n_cls=n_cls)
                 if ob_b is not None and hb_raw is not None:
                     # Drop transient GT that falls inside the (per-frame,
                     # possibly A/B-disjoint) unusable border: the source is
                     # physically shielded, so a positive label there is a
                     # poisoned target. Turn it into background.
-                    unusable = ob_b.sum(dim=1) > 0          # (B, grid, grid)
-                    hb_raw = hb_raw * (~unusable).unsqueeze(1).to(hb_raw.dtype)
-            pairs, ys, hmaps, obmaps = [], [], [], []
+                    unusable = ob_b[:, :2].sum(dim=1) > 0    # OB channels only
+                    keep = (~unusable).unsqueeze(1).to(hb_raw.dtype)
+                    hb_raw = hb_raw * keep
+                    if sb_raw is not None:
+                        sb_raw = sb_raw * keep.to(sb_raw.dtype)
+            pairs, ys, hmaps, obmaps, smaps = [], [], [], [], []
             for j in range(len(pb)):
                 p, y = pb[j], yb[j]
                 hj = hb_raw[j] if hb_raw is not None else None
                 oj = ob_b[j] if ob_b is not None else None
+                sj = sb_raw[j] if sb_raw is not None else None
                 if roi_active:
                     p, y = roisample_pair(p, y, src, dst,
                                           args.roi_min, min(args.roi_max, src))
-                p, y, hj, oj = augment_pair(p, y, crop=crop,
-                                            p_crop=1.0 if crop else 0.0,
-                                            hmap=hj, obmap=oj)
+                p, y, hj, oj, sj = augment_pair(p, y, crop=crop,
+                                                p_crop=1.0 if crop else 0.0,
+                                                hmap=hj, obmap=oj, smap=sj)
                 if hj is not None:
                     hmaps.append(hj)
                 if oj is not None:
                     obmaps.append(oj)
+                if sj is not None:
+                    smaps.append(sj)
                 pairs.append(p)
                 ys.append(y)
             pb = torch.stack(pairs).to(device)
             yb = torch.stack(ys).to(device)
             opt.zero_grad()
-            pose, det, ob = model(pb)
+            pose, det, ob, size = model(pb)
             rloss = regression_loss(pose, yb)
             loss = rloss
             dl = None
@@ -888,6 +990,13 @@ def main() -> None:
                 ol = ob_loss(F.adaptive_avg_pool2d(ob, (ob_grid, ob_grid)),
                              torch.stack(obmaps).to(device))
                 loss = loss + ob_w * ol
+            sl = None
+            if size_active and size is not None and smaps:
+                st = torch.log(torch.stack(smaps).clamp_min(1e-3)).to(device)
+                smask = (torch.stack(hmaps).to(device) == 1)
+                if smask.any():
+                    sl = F.smooth_l1_loss(size[smask], st[smask])
+                    loss = loss + size_w * sl
             loss.backward()
             opt.step()
             tot_loss += float(loss) * len(pb)
@@ -896,18 +1005,25 @@ def main() -> None:
                 tot_det += float(dl) * len(pb)
             if ol is not None:
                 tot_ob += float(ol) * len(pb)
+            if sl is not None:
+                tot_sz += float(sl) * len(pb)
             nb += len(pb)
         sched.step()
         vm = evaluate(model, val_pairs, va_y, device, args.batch,
                       scale=metric_scale, det_gt=val_det_gt if det_active else None,
                       det_n_cls=n_cls,
-                      ob_targets=val_ob if ob_active else None)
+                      ob_targets=val_ob if ob_active else None,
+                      mask_groups=MASK_GROUPS if ob_active else None,
+                      size_targets=val_size if size_active else None,
+                      size_scale=metric_scale)
         det_str = fmt_det(vm) if det_active else ""
-        ob_str = f"ob {1.0 - vm['ob_iou']:.3f}" if ob_active else ""
+        ob_str = (f"ob {vm['ob_iou']:.2f} sat {vm['sat_iou']:.2f}"
+                  if ob_active else "")
+        sz_str = f"sz {vm['size_mae']:.2f}px" if size_active else ""
         print(
             f"ep {ep + 1:02d}/{args.epochs}  loss {tot_loss / nb:.4f}  "
             f"lr {sched.get_last_lr()[0]:.1e}  ({time.perf_counter() - t_ep:.0f}s)  "
-            f"val: {fmt(vm)}  {det_str}  {ob_str}"
+            f"val: {fmt(vm)}  {det_str}  {ob_str}  {sz_str}"
         )
         score = vm["med_mag"] + 0.25 * vm["med_roll"]
         if best is None or score < best[0]:
@@ -926,22 +1042,28 @@ def main() -> None:
     _, ep_best, vm_best = best
     print(f"\nbest val at epoch {ep_best + 1}: {fmt(vm_best)}"
           + (f"  {fmt_det(vm_best)}" if det_active else "")
-          + (f"  ob IoU {vm_best['ob_iou']:.3f}" if ob_active else ""))
+          + (f"  ob IoU {vm_best['ob_iou']:.3f}  sat IoU {vm_best['sat_iou']:.3f}"
+             if ob_active else "")
+          + (f"  size MAE {vm_best['size_mae']:.2f}px" if size_active else ""))
 
     model.load_state_dict(torch.load(args.model_dir / "best.pt"))
-    for split, pairs, labn, dgt, obt in (
+    for split, pairs, labn, dgt, obt, szt in (
         ("val", val_pairs, va_y, val_det_gt if det_active else None,
-         val_ob if ob_active else None),
+         val_ob if ob_active else None, val_size if size_active else None),
         ("test", test_pairs, te_y, test_det_gt if det_active else None,
-         test_ob if ob_active else None),
+         test_ob if ob_active else None, test_size if size_active else None),
     ):
         m = evaluate(model, pairs, labn, device, args.batch, scale=metric_scale,
-                     det_gt=dgt, det_n_cls=n_cls, ob_targets=obt)
+                     det_gt=dgt, det_n_cls=n_cls, ob_targets=obt,
+                     mask_groups=MASK_GROUPS if obt is not None else None,
+                     size_targets=szt, size_scale=metric_scale)
         line = f"{split} final: {fmt(m)}"
         if dgt is not None:
             line += f"  {fmt_det(m)}"
         if obt is not None:
-            line += f"  ob IoU {m['ob_iou']:.3f}"
+            line += f"  ob IoU {m['ob_iou']:.3f}  sat IoU {m['sat_iou']:.3f}"
+        if szt is not None:
+            line += f"  size MAE {m['size_mae']:.2f}px"
         print(line)
 
     with (args.model_dir / "train_summary.json").open("w") as f:
@@ -956,6 +1078,8 @@ def main() -> None:
                 "det_weight": det_w,
                 "ob_channels": n_mask,
                 "ob_weight": ob_w,
+                "size_channels": n_size,
+                "size_weight": size_w,
                 "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             },
             f,

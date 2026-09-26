@@ -83,19 +83,22 @@ class ConvBlock(nn.Module):
 
 class PairRegNet(nn.Module):
     def __init__(self, in_ch: int = 2, feat: int = 32, drop: float = 0.15,
-                 pool_grid: int = 16, n_cls: int = 3, n_mask: int = 0) -> None:
+                 pool_grid: int = 16, n_cls: int = 3, n_mask: int = 0,
+                 n_size: int = 0) -> None:
         """Pose regression + transient heatmap detection + OB mask segmentation.
 
         ``n_cls > 0`` enables the transient heatmap head (per-class Gaussian
-        peaks).  ``n_mask > 0`` enables a full-resolution segmenter that marks
-        unusable sensor regions (optical black / shaded borders) for every
-        input frame (channel 0 = A, channel 1 = B), so detectors can avoid
-        them.  Both default off, keeping pose-only / detection-only checkpoints
-        fully backwards compatible.
+        peaks).  ``n_size > 0`` adds a parallel per-detection size regression
+        (apparent FWHM in pixels, one channel per class).  ``n_mask > 0``
+        enables a full-resolution segmenter that marks regions of interest /
+        to avoid; the channel layout is dataset-defined (e.g.
+        [A-unusable, B-unusable, B-satellite]).  All default off, keeping
+        pose-only / detection-only checkpoints fully compatible.
         """
         super().__init__()
         self.n_cls = int(n_cls)
         self.n_mask = int(n_mask)
+        self.n_size = int(n_size)
         ch = in_ch
         body = []
         for i in range(3):
@@ -115,6 +118,8 @@ class PairRegNet(nn.Module):
             nn.Linear(512, 4),
         )
         self.det = None
+        self.det_size = None
+        self.det_trunk = None
         self.ob = None
         self.res_enc = None
         if self.n_cls > 0 or self.n_mask > 0:
@@ -132,10 +137,10 @@ class PairRegNet(nn.Module):
             )
             din = ch + feat * 2
         if self.n_cls > 0:
-            # Detection decoder on the concatenated stride-8 features, then a
-            # 2x transposed-conv upsample to stride-4 resolution and a 1x1
-            # classifier.
-            self.det = nn.Sequential(
+            # Shared detection decoder on the concatenated stride-8 features,
+            # upsampled to stride-4.  Two 1x1 heads hang off its 64-ch output:
+            # per-class heatmap logits and an optional per-class size (FWHM).
+            self.det_trunk = nn.Sequential(
                 nn.Conv2d(din, 96, 3, padding=1),
                 nn.BatchNorm2d(96),
                 nn.ReLU(inplace=True),
@@ -145,14 +150,16 @@ class PairRegNet(nn.Module):
                 nn.ConvTranspose2d(96, 64, kernel_size=4, stride=2, padding=1),
                 nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(64, self.n_cls, 1),
             )
+            self.det = nn.Conv2d(64, self.n_cls, 1)
             # start from a quiet background (sigmoid ~ 0.007) so the focal
             # negatives are cheap and positives have logit headroom; avoids
             # collapsing the whole map to the sigmoid's steep region.
-            for m in self.det.modules():
-                if isinstance(m, nn.Conv2d) and m.out_channels == self.n_cls:
-                    nn.init.constant_(m.bias, -5.0)
+            nn.init.constant_(self.det.bias, -5.0)
+            if self.n_size > 0:
+                self.det_size = nn.Conv2d(64, self.n_size, 1)
+                # regress log(FWHM): start at ~3 px (e**1.1)
+                nn.init.constant_(self.det_size.bias, math.log(3.0))
         if self.n_mask > 0:
             # Full-resolution segmenter: three transposed-conv upsamples take
             # the stride-8 feature back to stride-1, then a 1x1 classifier.
@@ -177,21 +184,24 @@ class PairRegNet(nn.Module):
                     nn.init.constant_(m.bias, -1.0)
 
     def forward(self, pair: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """pair: (B, 2, H, W) float -> (pose, det, ob).
+                ) -> tuple[torch.Tensor, torch.Tensor | None,
+                           torch.Tensor | None, torch.Tensor | None]:
+        """pair: (B, 2, H, W) float -> (pose, det, ob, size).
 
-        pose : (B, 4)          global pose regression
-        det  : (B, n_cls, H/4, W/4) or None   per-class transient heatmaps
-        ob   : (B, n_mask, H, W) or None      per-frame unusable-region logits
+        pose : (B, 4)                 global pose regression
+        det  : (B, n_cls, H/4, W/4)   per-class transient heatmap logits
+        ob   : (B, n_mask, H, W)      per-frame region-mask logits
+        size : (B, n_size, H/4, W/4)  per-class log(FWHM, px) regression
 
-        Det/OB share the stride-8 fused features; B is warped onto A with the
-        *predicted, detached* pose so their gradients never damage the pose
-        head.
+        Det/OB/size share the stride-8 fused features; B is warped onto A with
+        the *predicted, detached* pose so their gradients never damage the pose
+        head.  Any head can be disabled (returns None).
         """
         f = self.body(pair)
         pose = self.head(self.reduce(f))
         det = None
         ob = None
+        size = None
         if self.res_enc is not None:
             dx = pose[:, 0]
             dy = pose[:, 1]
@@ -201,14 +211,17 @@ class PairRegNet(nn.Module):
             rfeat = self.res_enc(torch.cat([pair[:, 0:1], wb, res], dim=1))
             feat = torch.cat([f, rfeat], dim=1)
             if self.det is not None:
-                det = self.det(feat)
+                f4 = self.det_trunk(feat)
+                det = self.det(f4)
+                if self.det_size is not None:
+                    size = self.det_size(f4)
             if self.ob is not None:
                 ob = self.ob(feat)
                 if ob.shape[-2:] != pair.shape[-2:]:
                     ob = nn.functional.interpolate(
                         ob, size=pair.shape[-2:], mode="bilinear",
                         align_corners=False)
-        return pose, det, ob
+        return pose, det, ob, size
 
 
 def decode(y_raw: torch.Tensor) -> torch.Tensor:
@@ -237,19 +250,22 @@ def _infer_head_out(sd: dict, prefix: str) -> int:
 
 
 def build_model_from_state(sd: dict, n_cls: int | None = None,
-                           n_mask: int | None = None) -> PairRegNet:
+                           n_mask: int | None = None,
+                           n_size: int | None = None) -> PairRegNet:
     """Instantiate PairRegNet matching an old/new state dict.
 
-    Detection/OB weights exist only in checkpoints trained with those heads;
-    pose-only checkpoints get ``n_cls=0, n_mask=0``.  When the heads are
-    present their sizes are inferred from the output layers, so 3/4-class and
-    1/2-channel-mask checkpoints all load correctly.
+    Detection/size/OB weights exist only in checkpoints trained with those
+    heads; pose-only checkpoints get all zeros.  When the heads are present
+    their sizes are inferred from the output layers, so 1/3/4-class,
+    1/2/3-channel-mask and 0/1-size checkpoints all load correctly.
     """
     inferred_cls = _infer_head_out(sd, "det.")
     inferred_mask = _infer_head_out(sd, "ob.")
+    inferred_size = _infer_head_out(sd, "det_size.")
     net = PairRegNet(
         n_cls=n_cls if n_cls is not None else inferred_cls,
         n_mask=n_mask if n_mask is not None else inferred_mask,
+        n_size=n_size if n_size is not None else inferred_size,
     )
     net.load_state_dict(sd)
     net.eval()

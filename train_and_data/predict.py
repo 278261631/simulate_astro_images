@@ -24,6 +24,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model import (  # noqa: E402
+    DET_STRIDE,
     PairRegNet,
     build_model_from_state,
     decode,
@@ -112,40 +113,60 @@ def main() -> None:
 
     pair = preprocess(ia, ib).unsqueeze(0)  # (1, 2, H, W)
     with torch.no_grad():
-        pose, det, ob = model(pair)
+        pose, det, ob, size = model(pair)
         dx, dy, roll = decode(pose)[0].tolist()
         peaks = heat_to_peaks(torch.sigmoid(det))[0] if det is not None else []
-        # channel 1 = frame B (peaks are reported in B frame): unusable mask
-        ob_b = None
-        if ob is not None and ob.shape[1] > 1:
-            ob_b = (torch.sigmoid(ob[0, 1]) > 0.5).numpy()   # (model, model)
+        masks = torch.sigmoid(ob)[0].numpy() if ob is not None else None
+        size_map = torch.exp(size)[0].numpy() if size is not None else None
     dx /= s
     dy /= s
     print(f"A center in B frame:  dx {dx:+.2f} px   dy {dy:+.2f} px   droll {roll:+.2f}\u00b0")
     print(f"shift B by {dx:+.2f}, {dy:+.2f} px and {-roll:+.2f}\u00b0 to align B onto A")
 
+    # region masks (model grid): [0] A-unusable, [1] B-unusable, [2] B-satellite
+    unusable_b = sat_b = None
+    if masks is not None and masks.shape[0] >= 2:
+        unusable_b = masks[1] > 0.5
+        print(f"B-frame unusable (OB/shaded) region: "
+              f"{float(unusable_b.mean()) * 100:.1f}% of pixels")
+    if masks is not None and masks.shape[0] >= 3:
+        sat_b = masks[2] > 0.5
+        print(f"B-frame satellite region: {float(sat_b.mean()) * 100:.1f}% of pixels")
+
+    # suppress transient candidates that fall inside OB/shaded or satellite areas
+    drop = ob_mask = None
+    if unusable_b is not None or sat_b is not None:
+        drop = np.zeros_like(unusable_b if unusable_b is not None else sat_b)
+        if unusable_b is not None:
+            drop |= unusable_b
+        if sat_b is not None:
+            drop |= sat_b
     dropped = 0
-    if ob_b is not None:
-        cov = float(ob_b.mean())
-        print(f"B-frame unusable (OB/shaded) region: {cov * 100:.1f}% of pixels")
-        # drop detections that fall inside the unusable border ("avoid")
+    if drop is not None:
         kept = []
         for cl, x, y, sc in peaks:
-            xi = min(ob_b.shape[1] - 1, max(0, int(round(x))))  # model-grid px
-            yi = min(ob_b.shape[0] - 1, max(0, int(round(y))))
-            if ob_b[yi, xi]:
+            xi = min(drop.shape[1] - 1, max(0, int(round(x))))  # model-grid px
+            yi = min(drop.shape[0] - 1, max(0, int(round(y))))
+            if drop[yi, xi]:
                 dropped += 1
                 continue
             kept.append((cl, x, y, sc))
         peaks = kept
 
-    cls_names = ("appear", "satellite")
+    cls_names = ("appear",)
     if peaks:
         print("transient candidates in B frame (native px):")
         for cl, x, y, sc in peaks:
+            sz_txt = ""
+            if size_map is not None:
+                ci = int(round(x / DET_STRIDE - 0.5))
+                cj = int(round(y / DET_STRIDE - 0.5))
+                ci = min(size_map.shape[2] - 1, max(0, ci))
+                cj = min(size_map.shape[1] - 1, max(0, cj))
+                sz_txt = f"  FWHM {size_map[cl, cj, ci] / s:5.1f}px"
             x /= s
             y /= s
-            print(f"  {cls_names[cl]:>8}  x {x:7.1f}  y {y:7.1f}  score {sc:.2f}")
+            print(f"  {cls_names[cl]:>8}  x {x:7.1f}  y {y:7.1f}  score {sc:.2f}{sz_txt}")
     elif det is not None:
         print("transient candidates: none above threshold")
     if dropped:

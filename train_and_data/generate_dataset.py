@@ -28,7 +28,9 @@ Output (as raw numpy files so no image I/O library is required):
     <out>/<split>_a.npy        (N, H, W) uint8   frame A grayscale
     <out>/<split>_b.npy        (N, H, W) uint8   frame B grayscale
     <out>/<split>_labels.npy   (N, 3)   float64  [dx, dy, droll_deg]
-    <out>/<split>_meta.npz     fov, roll_a, stars_a, stars_b arrays
+    <out>/<split>_meta.npz     fov, roll_a/b, stars_a/b, transient GT incl.
+                              trans_mag/trans_mag_a, per-pair psf_sigma/gain/
+                              max_mag, and the ob_a/ob_b unusable-region masks
     <out>/params.json          dataset hyper-parameters
 
 With ``--smoke`` an additional small independent smoke-test dataset is written
@@ -55,6 +57,8 @@ if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
 
 from render_sky_patch import (  # noqa: E402
+    FLUX_MAX,
+    FLUX_MIN,
     angular_distance_deg,
     apply_roll,
     gnomonic_project,
@@ -67,6 +71,19 @@ DEFAULT_CATALOG = HERE.parent / "data" / "hip_catalog.csv"
 
 # luminance weights used when storing the RGB (H, W, 3) frames as grayscale
 _LUM = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+#: FWHM / sigma for a Gaussian (used for the per-detection size target)
+_FWHM_SIGMA = 2.3548200450309493
+
+
+def effective_fwhm_px(psf_sigma: float, trail_px: float) -> float:
+    """Apparent FWHM (px) of a source: PSF convolved with a uniform trail.
+
+    A point source has FWHM = 2.355*sigma; a trail of length L adds a variance
+    L**2/12 (uniform segment), combined in quadrature.
+    """
+    sigma_eff = math.sqrt(float(psf_sigma) ** 2 + (float(trail_px) ** 2) / 12.0)
+    return _FWHM_SIGMA * sigma_eff
 
 #: downsampling of the OB/unusable-region mask GT (matches model.DET_STRIDE)
 MASK_STRIDE = 4
@@ -262,7 +279,7 @@ def project_stars(ra_all, dec_all, mag_all, snap):
     xp = (x + half) / (2.0 * half) * (w - 1)
     yp = (half - y) / (2.0 * half) * (h - 1)
     on = (xp >= 0) & (xp < w) & (yp >= 0) & (yp < h)
-    flux = np.clip(np.power(10.0, -0.4 * (mag - 8.0)), 0.03, 80.0)
+    flux = np.clip(np.power(10.0, -0.4 * (mag - 8.0)), FLUX_MIN, FLUX_MAX)
     return {
         "x": x,
         "y": y,
@@ -279,18 +296,25 @@ def render_frame(snap: dict, art: dict, stars: dict,
                  satellites: list | None = None) -> np.ndarray:
     """(H, W, 3) float RGB in [0, 1] after PSF rendering + sky effects.
 
-    ``extra`` = (x, y, mag) tangent-plane arrays of additional point sources
-    (transients) rendered through the exact same PSF/tone-map as catalogue
-    stars, but excluded from the spike/ghost bookkeeping (``eff_stars``).
+    ``extra`` = (x, y, mag, trail_px, trail_ang) tangent-plane arrays of
+    additional sources (transients).  A non-zero ``trail_px`` renders the
+    source as a short PSF-convolved trail (a slowly moving object) instead of a
+    point; both share the exact PSF/tone-map of catalogue stars but are
+    excluded from the spike/ghost bookkeeping (``eff_stars``).
     ``satellites`` = list of trail parameter dicts drawn before the effects
     (so they receive the same seeing/background treatment).
     """
     if extra is not None and len(extra[0]) > 0:
+        n_star = len(stars["x"])
         xs = np.concatenate([stars["x"], extra[0]])
         ys = np.concatenate([stars["y"], extra[1]])
         ms = np.concatenate([stars["mag"], extra[2]])
+        zeros = np.zeros(n_star)
+        tpx = np.concatenate([zeros, extra[3]])
+        tang = np.concatenate([zeros, extra[4]])
     else:
         xs, ys, ms = stars["x"], stars["y"], stars["mag"]
+        tpx = tang = None
     rgb = render_psf_image(
         x=xs,
         y=ys,
@@ -300,6 +324,8 @@ def render_frame(snap: dict, art: dict, stars: dict,
         height_px=int(snap["height"]),
         psf_sigma=snap["psf_sigma"],
         gain=snap["gain"],
+        trail_px=tpx,
+        trail_ang=tang,
     )
     for s in satellites or []:
         sky_effects.draw_satellite_trail(
@@ -356,8 +382,16 @@ class PairSampler:
         if n <= 0:
             return None
         half = math.tan(math.radians(float(fov) / 2.0))
-        xa, ya, ma, xb, yb, mb = [], [], [], [], [], []
-        gt: list[tuple[float, float, float]] = []
+        mover_frac = float(getattr(self.args, "mover_frac", 0.0))
+        len_lo = float(getattr(self.args, "mover_len_min", 0.0))
+        len_hi = float(getattr(self.args, "mover_len_max", 12.0))
+        # extra_* tuples are (x, y, mag, trail_px, trail_ang); GT columns are
+        # (px_b, py_b, cls, mag_b, trail_px, trail_ang); mag_a in a parallel
+        # array (99 = absent in A).
+        xa, ya, ma, la, aa = [], [], [], [], []
+        xb, yb, mb, lb, ab = [], [], [], [], []
+        gt: list[tuple[float, float, float, float, float, float]] = []
+        gt_ma: list[float] = []
         for _ in range(n):
             cls = T_CLS["appear"]
             # position inside ~70% of the field so B's pointing offset/roll
@@ -366,9 +400,17 @@ class PairSampler:
             phi = rng.uniform(0.0, 2.0 * math.pi)
             u, v = rho * math.cos(phi), rho * math.sin(phi)
             ra, dec = gnomonic_inverse_pt(u, v, geo_a["ra"], geo_a["dec"])
-            # half the time absent in A ('new'), half a faint visible
-            # source ('brighten'); B ranges from bright to moderate
-            mag_a = float(rng.uniform(9.5, 11.5)) if rng.rand() < 0.5 else 99.0
+            # A slowly moving object (e.g. a near-Earth asteroid): only present
+            # in B, rendered as a short PSF-convolved trail -- the same class as
+            # the point 'appear' sources, just a different morphology.
+            mover = rng.rand() < mover_frac
+            trail = float(rng.uniform(len_lo, len_hi)) if mover else 0.0
+            ang = float(rng.uniform(0.0, 2.0 * math.pi))
+            if mover:
+                mag_a = 99.0                    # absent in A
+            else:
+                # half absent in A ('new'), half a faint visible source
+                mag_a = float(rng.uniform(9.5, 11.5)) if rng.rand() < 0.5 else 99.0
             mag_b = float(rng.uniform(0.0, 9.0))
 
             pA = _tangent_xy_in_frame(ra, dec, geo_a, fov)
@@ -380,16 +422,22 @@ class PairSampler:
                 continue
             if mag_a < 90.0:
                 xa.append(pA[0]); ya.append(pA[1]); ma.append(mag_a)
+                la.append(0.0); aa.append(0.0)
             if mag_b < 90.0:
                 xb.append(pB[0]); yb.append(pB[1]); mb.append(mag_b)
-            gt.append((px_b, py_b, float(cls)))
+                lb.append(trail); ab.append(ang)
+            gt.append((px_b, py_b, float(cls), float(mag_b), trail, ang))
+            gt_ma.append(float(mag_a))
 
         if not gt:
             return None
-        ex_a = (np.asarray(xa), np.asarray(ya), np.asarray(ma)) if xa else None
-        ex_b = (np.asarray(xb), np.asarray(yb), np.asarray(mb)) if xb else None
+        ex_a = ((np.asarray(xa), np.asarray(ya), np.asarray(ma),
+                 np.asarray(la), np.asarray(aa)) if xa else None)
+        ex_b = ((np.asarray(xb), np.asarray(yb), np.asarray(mb),
+                 np.asarray(lb), np.asarray(ab)) if xb else None)
         return {"extra_a": ex_a, "extra_b": ex_b,
-                "gt": np.asarray(gt, dtype=np.float64)}
+                "gt": np.asarray(gt, dtype=np.float64),
+                "gt_mag_a": np.asarray(gt_ma, dtype=np.float64)}
 
     def sample_satellites(self, rng: np.random.RandomState, size: int, fov: float,
                           geo_a: dict, geo_b: dict) -> dict | None:
@@ -546,13 +594,22 @@ class PairSampler:
             "stars_b": stars_b["count"] if stars_b is not None else 0,
             "bg_a": float(art_a["bg_level"]),
             "bg_b": float(art_b["bg_level"]),
+            # appearance parameters (shared by A/B): needed to interpret the
+            # rendered size/brightness of a source's point-spread function.
+            "psf_sigma": float(snap["psf_sigma"]),
+            "gain": float(snap["gain"]),
+            "max_mag": float(snap["max_mag"]),
         }
         # unusable-region masks (optical black + shaded borders), one per frame
         grid = max(1, size // MASK_STRIDE)
         rec["ob_a"] = framing_mask(art_a, size, grid)
         rec["ob_b"] = framing_mask(art_b, size, grid)
         if trans is not None:
-            rec["gt_trans"] = trans["gt"]     # (K, 3) pxB_x, pxB_y, cls
+            gt = trans["gt"]                           # (K,6) px,py,cls,mag_b,len,ang
+            size = np.array([effective_fwhm_px(snap["psf_sigma"], L)
+                             for L in gt[:, 4]])
+            rec["gt_trans"] = np.column_stack([gt, size])   # (K,7) +apparent FWHM
+            rec["gt_trans_mag_a"] = trans["gt_mag_a"]  # (K,) mag in A (99=absent)
         if sats is not None:
             rec["gt_sat"] = sats["gt"]        # (M, 2) pxB_x, pxB_y (class 3)
         return rec
@@ -844,12 +901,25 @@ def run_split(
     meta["trans_x"] = np.full((count, MAX_TRANSIENTS), -1.0)
     meta["trans_y"] = np.full((count, MAX_TRANSIENTS), -1.0)
     meta["trans_cls"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    # per-transient magnitudes (B-frame is the detection frame; A may be 99=absent)
+    meta["trans_mag"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    meta["trans_mag_a"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    # per-transient trail (slowly moving object morphology; 0 = round point)
+    meta["trans_len"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    meta["trans_ang"] = np.full((count, MAX_TRANSIENTS), -1.0)
+    # per-transient apparent size = effective FWHM (px), PSF + trail combined
+    meta["trans_size"] = np.full((count, MAX_TRANSIENTS), -1.0)
     # satellite-trail GT (centreline points, class 3, padded with -1)
     meta["sat_n"] = np.zeros(count, dtype=np.int32)
     meta["sat_x"] = np.full((count, MAX_SAT_POINTS), -1.0)
     meta["sat_y"] = np.full((count, MAX_SAT_POINTS), -1.0)
     meta["bg_a"] = np.zeros(count)
     meta["bg_b"] = np.zeros(count)
+    # appearance parameters per pair (shared by A/B): they set how large / bright
+    # each rendered point-spread function is.
+    meta["psf_sigma"] = np.zeros(count)
+    meta["gain"] = np.zeros(count)
+    meta["max_mag"] = np.zeros(count)
     # unusable-region masks (stride-4 lattice): 1 = optical black / shaded
     grid = max(1, size // MASK_STRIDE)
     meta["ob_grid"] = np.asarray(grid, dtype=np.int32)
@@ -878,6 +948,9 @@ def run_split(
         meta["bg_b"][i] = rec.get("bg_b", 0.0)
         meta["ob_a"][i] = rec["ob_a"]
         meta["ob_b"][i] = rec["ob_b"]
+        meta["psf_sigma"][i] = rec["psf_sigma"]
+        meta["gain"][i] = rec["gain"]
+        meta["max_mag"][i] = rec["max_mag"]
         gt = rec.get("gt_trans")
         if gt is not None and len(gt):
             k = min(len(gt), MAX_TRANSIENTS)
@@ -885,6 +958,13 @@ def run_split(
             meta["trans_x"][i, :k] = gt[:k, 0]
             meta["trans_y"][i, :k] = gt[:k, 1]
             meta["trans_cls"][i, :k] = gt[:k, 2]
+            meta["trans_mag"][i, :k] = gt[:k, 3]
+            meta["trans_len"][i, :k] = gt[:k, 4]
+            meta["trans_ang"][i, :k] = gt[:k, 5]
+            meta["trans_size"][i, :k] = gt[:k, 6]
+            gma = rec.get("gt_trans_mag_a")
+            if gma is not None:
+                meta["trans_mag_a"][i, :k] = gma[:k]
         sg = rec.get("gt_sat")
         if sg is not None and len(sg):
             k = min(len(sg), MAX_SAT_POINTS)
@@ -1022,10 +1102,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-roll", type=float, default=8.0,
                    help="max |roll error| between A and B in degrees")
     p.add_argument("--transient-rate", type=float, default=1.2,
-                   help="mean number of point-source 'appear' transients per "
-                        "pair (Poisson); 0 disables. Class 0 = appear "
+                   help="mean number of 'appear' transients per pair "
+                        "(Poisson); 0 disables. Class 0 = appear "
                         "(A absent/faint -> B bright), GT in *_meta.npz "
                         "trans_x/trans_y/trans_cls (B-frame px)")
+    p.add_argument("--mover-frac", type=float, default=0.35,
+                   help="fraction of transients rendered as a slowly moving "
+                        "object: a short PSF-convolved trail (ellipse for short "
+                        "lengths), B-frame only, same class 0")
+    p.add_argument("--mover-len-min", type=float, default=0.0,
+                   help="min trail length (px) for moving-object transients")
+    p.add_argument("--mover-len-max", type=float, default=12.0,
+                   help="max trail length (px) for moving-object transients")
     p.add_argument("--satellite-rate", type=float, default=0.8,
                    help="mean number of tumbling satellite trails per pair "
                         "(Poisson, capped at 2); 0 disables. GT in "
@@ -1036,10 +1124,14 @@ def parse_args() -> argparse.Namespace:
                    help="max uniform sky-background offset (A/B sampled "
                         "independently)")
     p.add_argument("--min-stars", type=int, default=5)
-    p.add_argument("--psf-sigma-min", type=float, default=0.7,
-                   help="lower PSF sigma bound (px) sampled per frame")
-    p.add_argument("--psf-sigma-max", type=float, default=2.2,
-                   help="upper PSF sigma bound (px) sampled per frame")
+    p.add_argument("--psf-sigma-min", type=float, default=0.2,
+                   help="lower PSF sigma bound (px) sampled per frame "
+                        "(small = sharp, compact star discs)")
+    p.add_argument("--psf-sigma-max", type=float, default=8.5,
+                   help="upper PSF sigma bound (px) sampled per frame "
+                        "(large = big, soft star discs); the [min,max] span is "
+                        "the dataset-wide range of star sizes.  Very large "
+                        "sigma dims faint stars and slows rendering.")
     p.add_argument("--dec-min", type=float, default=-75.0)
     p.add_argument("--dec-max", type=float, default=75.0)
     p.add_argument("--check-dir", type=Path, default=HERE / "check_data",
@@ -1084,8 +1176,10 @@ def main() -> None:
                     "splits": summaries,
                     "label": "dx,dy = A-centre in B frame minus B-centre (px); droll = B-A (deg)",
                     "transient_classes": {k: v for k, v in T_CLS.items()},
-                    "gt": ("trans_x/trans_y/trans_cls (points, B-frame px) and "
-                           "sat_x/sat_y (satellite centreline points, B-frame px)"),
+                    "gt": ("trans_x/trans_y/trans_cls (+ trans_mag/trans_mag_a) "
+                           "(points, B-frame px) and sat_x/sat_y (satellite "
+                           "centreline points, B-frame px); per-pair appearance "
+                           "psf_sigma/gain/max_mag"),
                     "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
                 },
                 f,

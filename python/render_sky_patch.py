@@ -145,10 +145,18 @@ def gnomonic_project(
     return x, y, visible
 
 
+#: relative-flux clip: the lower bound keeps a noise floor, the upper bound
+#: caps the brightest stars.  Raising FLUX_MAX lets bright stars carry more
+#: signal so their saturated disc grows (magnitude ordering among the very
+#: brightest is otherwise lost -- they all flatten to the same size).
+FLUX_MIN = 0.03
+FLUX_MAX = 1000.0
+
+
 def mag_to_flux(mag: np.ndarray) -> np.ndarray:
     # Relative flux scale for point source rendering.
     flux = np.power(10.0, -0.4 * (mag - 8.0))
-    return np.clip(flux, 0.03, 80.0)
+    return np.clip(flux, FLUX_MIN, FLUX_MAX)
 
 
 def apply_roll(x: np.ndarray, y: np.ndarray, roll_deg: float) -> tuple[np.ndarray, np.ndarray]:
@@ -202,27 +210,67 @@ def render_psf_image(
     height_px: int,
     psf_sigma: float,
     gain: float,
+    trail_px: np.ndarray | None = None,
+    trail_ang: np.ndarray | None = None,
 ) -> np.ndarray:
+    """Render point sources as a PSF-convolved flux field.
+
+    ``trail_px`` / ``trail_ang`` (optional, aligned with ``x``) smear each
+    source along a straight segment of the given length (pixels) and angle
+    (radians, pixel space) before the PSF is applied -- a slowly moving object.
+    Lengths much shorter than the PSF give an ellipse, longer ones a short
+    trail.  ``trail_px=None`` keeps the original point behaviour.
+    """
     star_field = np.zeros((height_px, width_px), dtype=np.float32)
     flux = mag_to_flux(mag).astype(np.float32)
 
     xp = (x + half_extent) / (2.0 * half_extent) * (width_px - 1)
     yp = (half_extent - y) / (2.0 * half_extent) * (height_px - 1)
-    xi = np.rint(xp).astype(np.int32)
-    yi = np.rint(yp).astype(np.int32)
 
-    valid = (xi >= 0) & (xi < width_px) & (yi >= 0) & (yi < height_px)
-    xi = xi[valid]
-    yi = yi[valid]
-    flux = flux[valid]
-    np.add.at(star_field, (yi, xi), flux)
+    if trail_px is None:
+        single = np.ones(len(xp), dtype=bool)
+    else:
+        single = np.asarray(trail_px) <= 1e-3
+
+    # point sources: vectorised single-pixel deposit (the common case)
+    if single.any():
+        xi = np.rint(xp[single]).astype(np.int32)
+        yi = np.rint(yp[single]).astype(np.int32)
+        valid = (xi >= 0) & (xi < width_px) & (yi >= 0) & (yi < height_px)
+        np.add.at(star_field, (yi[valid], xi[valid]), flux[single][valid])
+
+    # slowly moving sources: deposit the flux along a straight segment
+    if not single.all():
+        if trail_ang is None:
+            trail_ang = np.zeros(len(xp))
+        for k in np.nonzero(~single)[0]:
+            length = float(trail_px[k])
+            steps = max(2, int(math.ceil(length)) + 1)
+            dx = math.cos(float(trail_ang[k])) * length
+            dy = math.sin(float(trail_ang[k])) * length
+            f = float(flux[k]) / steps
+            for t in np.linspace(0.0, 1.0, steps):
+                xi = int(round(float(xp[k]) + t * dx))
+                yi = int(round(float(yp[k]) + t * dy))
+                if 0 <= xi < width_px and 0 <= yi < height_px:
+                    star_field[yi, xi] += f
 
     kernel = gaussian_kernel1d(psf_sigma)
     blurred = convolve_along_axis(star_field, kernel, axis=1)
     blurred = convolve_along_axis(blurred, kernel, axis=0)
 
-    # Mix a small sharp core with blurred halo to keep stars point-like.
+    # Mix a small sharp core with the blurred halo to keep stars point-like.
+    # The core is convolved with a *narrower* Gaussian (and renormalised to its
+    # centre value) so it keeps the same peak brightness but gets a proper,
+    # PSF-consistent profile: a raw sqrt(flux) spike would dominate at low flux
+    # and render faint stars as single, sub-PSF, dim pixels instead of stars.
     core = np.sqrt(np.clip(star_field, 0.0, None))
+    core_kernel = gaussian_kernel1d(0.5 * psf_sigma)
+    core = convolve_along_axis(core, core_kernel, axis=1)
+    core = convolve_along_axis(core, core_kernel, axis=0)
+    _ck = float(core_kernel[len(core_kernel) // 2])
+    if _ck > 1e-6:
+        core = core / (_ck * _ck)
     signal = np.clip(blurred + 0.12 * core, 0.0, None)
     luminance = 1.0 - np.exp(-gain * signal)
     luminance = np.clip(luminance, 0.0, 1.0)

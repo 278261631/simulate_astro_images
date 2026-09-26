@@ -200,10 +200,11 @@ class SplitData:
         return dict(row) if row else {}
 
     def det_gt(self, i: int) -> list[tuple[float, float, int]]:
-        """Ground-truth transients for sample i as (x, y, cls) in B-frame px.
+        """Ground-truth detection targets for sample i as (x, y, cls) in B-frame px.
 
-        Class 0 = appear, 1 = dim point sources; class 2 = satellite trail
-        centreline points.
+        Class 0 = appear (the only detection class).  Satellite trails are
+        supervised by a segmentation head, so their centreline points are not
+        returned here as detection GT.
         """
         if self.trans is None:
             return []
@@ -213,10 +214,6 @@ class SplitData:
                 out.append((float(self.trans["trans_x"][i, j]),
                             float(self.trans["trans_y"][i, j]),
                             int(round(float(self.trans["trans_cls"][i, j])))))
-        if "sat_n" in self.trans:
-            for j in range(int(self.trans["sat_n"][i])):
-                out.append((float(self.trans["sat_x"][i, j]),
-                            float(self.trans["sat_y"][i, j]), 2))
         return out
 
 
@@ -553,7 +550,7 @@ class EvalWorker(QThread):
                     if self.isInterruptionRequested():
                         return
                     en = min(st + self.batch, n)
-                    pose, det, _ob = self.net(pairs[st:en])
+                    pose, det, _ob, _size = self.net(pairs[st:en])
                     out = decode(pose).numpy()
                     pred[st:en] = out
                     if det is not None:
