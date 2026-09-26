@@ -424,7 +424,7 @@ def to_pixmap(arr, max_side: int) -> QPixmap:
     return pm.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
-_DET_COLORS = {0: (255, 40, 40), 1: (60, 200, 255), 2: (200, 80, 255)}
+_DET_COLORS = {0: (255, 40, 40), 1: (200, 80, 255)}  # 0 = appear, 1 = satellite
 
 
 def annotate_markers(u8: np.ndarray, pts, use_class: bool = True,
@@ -459,7 +459,7 @@ def annotate_markers(u8: np.ndarray, pts, use_class: bool = True,
 
 
 def det_summary(records: list[dict], src: "SplitData", tol_px: float = 8.0,
-                sat_cls: int = 2, sat_radius: float = 24.0) -> dict:
+                sat_cls: int = 1, sat_radius: float = 24.0) -> dict:
     """Aggregate transient detection P/R against split GT (native B-frame px).
 
     Point classes are matched one-to-one; satellite trails are clustered into

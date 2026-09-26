@@ -39,8 +39,8 @@ from model import (  # noqa: E402
     preprocess,
 )
 
-#: class index of the satellite trail (appear=0, dim=1, satellite=2)
-SAT_CLS = 2
+#: class index of the satellite trail (appear=0, satellite=1)
+SAT_CLS = 1
 
 
 def set_seed(seed: int) -> None:
@@ -346,7 +346,7 @@ def build_heat_targets(meta: dict, n: int, grid: int, sigma: float = 1.2,
 
     CenterNet-style supervision: +1 at each source centre cell (radius ~1),
     -1 in the ignore ring around it, 0 elsewhere.  Point transients
-    (new/brighten/dim) come from ``trans_*``; satellite trails are stored as
+    (appear) come from ``trans_*``; satellite trails are stored as
     multiple centreline points (class 3) in ``sat_*``.
     """
     if "trans_n" not in meta and "sat_n" not in meta:
@@ -409,7 +409,7 @@ class TransientHeatLoss(nn.Module):
         n_cls = logits.shape[1]
         # Per-class balanced terms: satellite trails contribute dozens of GT
         # points each, so a global positive mean would swamp the sparse
-        # point-source classes (new/brighten/dim).
+        # point-source class (appear).
         pos_acc = torch.zeros((), device=logits.device)
         neg_acc = torch.zeros((), device=logits.device)
         n_pos = 0
@@ -434,7 +434,7 @@ def det_metrics(model_pred_peaks: list, gt: np.ndarray, tol_px: float = 8.0,
                 sat_radius: float = 24.0) -> dict | None:
     """Peak-matching precision / recall per class.
 
-    Point classes (new/brighten/dim) are matched one-to-one.  Satellite GT is
+    Point classes (appear) are matched one-to-one.  Satellite GT is
     stored as many centreline points; those are clustered into trail
     *instances* and a hit on any point detects the whole trail (so recall is
     not diluted by trail length).

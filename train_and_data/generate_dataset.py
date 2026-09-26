@@ -74,9 +74,11 @@ MASK_STRIDE = 4
 # transient-source bookkeeping
 MAX_TRANSIENTS = 8                     # point sources per pair stored in *_meta.npz
 MAX_SAT_POINTS = 96                    # satellite-trail GT points per pair
-# Classes: appear = new OR brightening (A absent/faint -> B bright), dim =
-# A bright -> B faint/absent, satellite = tumbling trail.
-T_CLS = {"appear": 0, "dim": 1, "satellite": 2}
+# Classes: appear = new OR brightening (A absent/faint -> B bright),
+# satellite = tumbling trail.  The former 'dim' class (A bright -> B faint)
+# was removed: with the absolute residual |A - wB| its signature is identical
+# to ordinary mis-registration artifacts, which made it unfilterable.
+T_CLS = {"appear": 0, "satellite": 1}
 SAT_CLS = T_CLS["satellite"]
 SAT_PROFILES = ("flat", "center", "glint")
 
@@ -343,7 +345,6 @@ class PairSampler:
             0 appear - absent/faint in A, clearly bright in B (merges the old
                        'new' and 'brighten' cases; the A-side may be empty or a
                        faint visible source)
-            1 dim    - clearly bright in A, much fainter (or gone) in B
         Only strong changes are generated (no mild variations).
         """
         rate = float(getattr(self.args, "transient_rate", 0.0))
@@ -358,26 +359,17 @@ class PairSampler:
         xa, ya, ma, xb, yb, mb = [], [], [], [], [], []
         gt: list[tuple[float, float, float]] = []
         for _ in range(n):
-            cls = int(rng.choice([T_CLS["appear"], T_CLS["dim"]], p=[0.62, 0.38]))
+            cls = T_CLS["appear"]
             # position inside ~70% of the field so B's pointing offset/roll
             # keeps the source inside both frames.
             rho = half * 0.70 * math.sqrt(rng.uniform(0.0, 1.0))
             phi = rng.uniform(0.0, 2.0 * math.pi)
             u, v = rho * math.cos(phi), rho * math.sin(phi)
             ra, dec = gnomonic_inverse_pt(u, v, geo_a["ra"], geo_a["dec"])
-            mag_a, mag_b = 99.0, 99.0
-            if cls == T_CLS["appear"]:
-                # half the time absent in A ('new'), half a faint visible
-                # source ('brighten'); B ranges from bright to moderate
-                if rng.rand() < 0.5:
-                    mag_a = float(rng.uniform(9.5, 11.5))
-                mag_b = float(rng.uniform(0.0, 9.0))
-            else:  # dim: clearly bright in A, much fainter (or gone) in B
-                mag_a = float(rng.uniform(0.0, 4.5))
-                if rng.rand() < 0.4:
-                    mag_b = 99.0                       # vanished
-                else:
-                    mag_b = float(rng.uniform(9.5, 13.0))
+            # half the time absent in A ('new'), half a faint visible
+            # source ('brighten'); B ranges from bright to moderate
+            mag_a = float(rng.uniform(9.5, 11.5)) if rng.rand() < 0.5 else 99.0
+            mag_b = float(rng.uniform(0.0, 9.0))
 
             pA = _tangent_xy_in_frame(ra, dec, geo_a, fov)
             pB = _tangent_xy_in_frame(ra, dec, geo_b, fov)
@@ -589,8 +581,7 @@ def _check_indices(meta: dict, count: int, k: int, rng: np.random.RandomState) -
     if count <= 0 or k <= 0:
         return []
     k = min(k, count)
-    buckets: dict[str, list[int]] = {"appear": [], "dim": [],
-                                     "satellite": [], "none": []}
+    buckets: dict[str, list[int]] = {"appear": [], "satellite": [], "none": []}
     tn = meta.get("trans_n")
     tx = meta.get("trans_cls")
     sn = meta.get("sat_n")
@@ -598,7 +589,7 @@ def _check_indices(meta: dict, count: int, k: int, rng: np.random.RandomState) -
         tags = set()
         if tn is not None:
             for j in range(int(tn[i])):
-                tags.add(["appear", "dim", "satellite"][int(round(tx[i, j]))])
+                tags.add(["appear", "satellite"][int(round(tx[i, j]))])
         if sn is not None and int(sn[i]) > 0:
             tags.add("satellite")
         if not tags:
@@ -606,7 +597,7 @@ def _check_indices(meta: dict, count: int, k: int, rng: np.random.RandomState) -
         for t in tags:
             buckets[t].append(i)
     chosen: list[int] = []
-    order = ["appear", "dim", "satellite", "none"]
+    order = ["appear", "satellite", "none"]
     rng.shuffle(order)
     for key in order:
         if len(chosen) >= k:
@@ -706,7 +697,7 @@ def export_check_samples(
         if s_pts:
             sb_ann = _annotate(sb_ann, s_pts, [SAT_CLS] * len(s_pts), radius=1)
         sb3 = np.dstack([sb_ann, sb_ann, sb_ann]) if sb_ann.ndim == 2 else sb_ann
-        names = ["appear", "dim", "satellite"]
+        names = ["appear", "satellite"]
         txt += (
             f"transients       {[names[c] for c in p_cls]}\n"
             f"satellite points {sn}\n"
@@ -1031,9 +1022,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-roll", type=float, default=8.0,
                    help="max |roll error| between A and B in degrees")
     p.add_argument("--transient-rate", type=float, default=1.2,
-                   help="mean number of point-source transients per pair "
-                        "(Poisson); 0 disables. Classes: new / brighten / dim, "
-                        "GT in *_meta.npz trans_x/trans_y/trans_cls (B-frame px)")
+                   help="mean number of point-source 'appear' transients per "
+                        "pair (Poisson); 0 disables. Class 0 = appear "
+                        "(A absent/faint -> B bright), GT in *_meta.npz "
+                        "trans_x/trans_y/trans_cls (B-frame px)")
     p.add_argument("--satellite-rate", type=float, default=0.8,
                    help="mean number of tumbling satellite trails per pair "
                         "(Poisson, capped at 2); 0 disables. GT in "
@@ -1055,6 +1047,9 @@ def parse_args() -> argparse.Namespace:
                         "(for manual inspection)")
     p.add_argument("--check-count", type=int, default=6,
                    help="random pairs exported per split (0 to disable)")
+    p.add_argument("--check-splits", type=str, default="test",
+                   help="comma-separated splits to export check PNGs from "
+                        "(default: test); e.g. 'train,val,test' or '' for none")
     return p.parse_args()
 
 
@@ -1072,10 +1067,12 @@ def main() -> None:
     sampler = PairSampler((ra, dec, mag), args)
     t0 = time.perf_counter()
     summaries = []
+    check_splits = {s.strip() for s in str(args.check_splits).split(",") if s.strip()}
     for split, n in (("train", args.train), ("val", args.val), ("test", args.test)):
         if n <= 0:
             continue
-        s = run_split(sampler, n, split, args.out, t0, args.check_dir, args.check_count)
+        cc = args.check_count if split in check_splits else 0
+        s = run_split(sampler, n, split, args.out, t0, args.check_dir, cc)
         summaries.append(s)
 
     if summaries:

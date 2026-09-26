@@ -139,7 +139,7 @@ def main() -> None:
             kept.append((cl, x, y, sc))
         peaks = kept
 
-    cls_names = ("appear", "dim", "satellite")
+    cls_names = ("appear", "satellite")
     if peaks:
         print("transient candidates in B frame (native px):")
         for cl, x, y, sc in peaks:
