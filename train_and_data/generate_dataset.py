@@ -72,19 +72,6 @@ DEFAULT_CATALOG = HERE.parent / "data" / "hip_catalog.csv"
 # luminance weights used when storing the RGB (H, W, 3) frames as grayscale
 _LUM = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
-#: FWHM / sigma for a Gaussian (used for the per-detection size target)
-_FWHM_SIGMA = 2.3548200450309493
-
-
-def effective_fwhm_px(psf_sigma: float, trail_px: float) -> float:
-    """Apparent FWHM (px) of a source: PSF convolved with a uniform trail.
-
-    A point source has FWHM = 2.355*sigma; a trail of length L adds a variance
-    L**2/12 (uniform segment), combined in quadrature.
-    """
-    sigma_eff = math.sqrt(float(psf_sigma) ** 2 + (float(trail_px) ** 2) / 12.0)
-    return _FWHM_SIGMA * sigma_eff
-
 #: downsampling of the OB/unusable-region mask GT (matches model.DET_STRIDE)
 MASK_STRIDE = 4
 
@@ -605,10 +592,7 @@ class PairSampler:
         rec["ob_a"] = framing_mask(art_a, size, grid)
         rec["ob_b"] = framing_mask(art_b, size, grid)
         if trans is not None:
-            gt = trans["gt"]                           # (K,6) px,py,cls,mag_b,len,ang
-            size = np.array([effective_fwhm_px(snap["psf_sigma"], L)
-                             for L in gt[:, 4]])
-            rec["gt_trans"] = np.column_stack([gt, size])   # (K,7) +apparent FWHM
+            rec["gt_trans"] = trans["gt"]              # (K,6) px,py,cls,mag_b,len,ang
             rec["gt_trans_mag_a"] = trans["gt_mag_a"]  # (K,) mag in A (99=absent)
         if sats is not None:
             rec["gt_sat"] = sats["gt"]        # (M, 2) pxB_x, pxB_y (class 3)
@@ -907,8 +891,6 @@ def run_split(
     # per-transient trail (slowly moving object morphology; 0 = round point)
     meta["trans_len"] = np.full((count, MAX_TRANSIENTS), -1.0)
     meta["trans_ang"] = np.full((count, MAX_TRANSIENTS), -1.0)
-    # per-transient apparent size = effective FWHM (px), PSF + trail combined
-    meta["trans_size"] = np.full((count, MAX_TRANSIENTS), -1.0)
     # satellite-trail GT (centreline points, class 3, padded with -1)
     meta["sat_n"] = np.zeros(count, dtype=np.int32)
     meta["sat_x"] = np.full((count, MAX_SAT_POINTS), -1.0)
@@ -961,7 +943,6 @@ def run_split(
             meta["trans_mag"][i, :k] = gt[:k, 3]
             meta["trans_len"][i, :k] = gt[:k, 4]
             meta["trans_ang"][i, :k] = gt[:k, 5]
-            meta["trans_size"][i, :k] = gt[:k, 6]
             gma = rec.get("gt_trans_mag_a")
             if gma is not None:
                 meta["trans_mag_a"][i, :k] = gma[:k]

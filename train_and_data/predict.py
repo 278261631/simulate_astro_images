@@ -24,7 +24,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model import (  # noqa: E402
-    DET_STRIDE,
     PairRegNet,
     build_model_from_state,
     decode,
@@ -113,11 +112,10 @@ def main() -> None:
 
     pair = preprocess(ia, ib).unsqueeze(0)  # (1, 2, H, W)
     with torch.no_grad():
-        pose, det, ob, size = model(pair)
+        pose, det, ob = model(pair)
         dx, dy, roll = decode(pose)[0].tolist()
         peaks = heat_to_peaks(torch.sigmoid(det))[0] if det is not None else []
         masks = torch.sigmoid(ob)[0].numpy() if ob is not None else None
-        size_map = torch.exp(size)[0].numpy() if size is not None else None
     dx /= s
     dy /= s
     print(f"A center in B frame:  dx {dx:+.2f} px   dy {dy:+.2f} px   droll {roll:+.2f}\u00b0")
@@ -157,16 +155,9 @@ def main() -> None:
     if peaks:
         print("transient candidates in B frame (native px):")
         for cl, x, y, sc in peaks:
-            sz_txt = ""
-            if size_map is not None:
-                ci = int(round(x / DET_STRIDE - 0.5))
-                cj = int(round(y / DET_STRIDE - 0.5))
-                ci = min(size_map.shape[2] - 1, max(0, ci))
-                cj = min(size_map.shape[1] - 1, max(0, cj))
-                sz_txt = f"  FWHM {size_map[cl, cj, ci] / s:5.1f}px"
             x /= s
             y /= s
-            print(f"  {cls_names[cl]:>8}  x {x:7.1f}  y {y:7.1f}  score {sc:.2f}{sz_txt}")
+            print(f"  {cls_names[cl]:>8}  x {x:7.1f}  y {y:7.1f}  score {sc:.2f}")
     elif det is not None:
         print("transient candidates: none above threshold")
     if dropped:
